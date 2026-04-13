@@ -1,5 +1,0 @@
-cd ~/projects/power-analyzer/src
-source venv/bin/activate
-
-python main.py
-
