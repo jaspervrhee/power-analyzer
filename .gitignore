@@ -1,5 +1,6 @@
 # Build output
 src/cpp/build/
+build/
 
 # CMake
 CMakeCache.txt
@@ -7,12 +8,15 @@ CMakeFiles/
 cmake_install.cmake
 compile_commands.json
 
-# Compiled binaries
+# Compiled binaries & executables
 *.exe
 *.out
 *.a
 *.o
 *.obj
+src/cpp/power_analyzer
+src/cpp/power_analyzer_stub
+src/cpp/real_test
 
 # Python
 __pycache__/

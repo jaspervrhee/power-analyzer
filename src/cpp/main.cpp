@@ -4,27 +4,35 @@
 #include "hld/LogHLD.h"
 #include "controller/Controller.h"
 
-#ifdef _WIN32
-#  include "lld/ModbusRtuSerialStub.h"
-   using SerialImpl = ModbusRtuSerialStub;
+// #define USE_REAL_SERIAL  // Uncomment for real serial (Linux), comment for stub
+
+#ifdef USE_REAL_SERIAL
+#include "lld/ModbusRtuSerial.h"
+using SerialImpl = ModbusRtuSerial;
 #else
-#  include "lld/ModbusRtuSerial.h"
-   using SerialImpl = ModbusRtuSerial;
+#ifdef _WIN32
+#include "lld/ModbusRtuSerialStub.h"
+using SerialImpl = ModbusRtuSerialStub;
+#else
+#include "lld/ModbusRtuSerial.h"
+using SerialImpl = ModbusRtuSerial;
+#endif
 #endif
 
 #include <iostream>
 #include <chrono>
 #include <thread>
 
-static void printMeasurement(const MeterMeasurement& m)
+static void printMeasurement(const MeterMeasurement &m)
 {
-    if (!m.valid) {
+    if (!m.valid)
+    {
         std::cout << "[Controller] Meting ongeldig\n";
         return;
     }
 
     std::cout << "\n=== IEM3250 Meting ===\n";
-    std::cout << "Stroom  L1/L2/L3:     " << m.currentL1   << " / " << m.currentL2   << " / " << m.currentL3   << " A\n";
+    std::cout << "Stroom  L1/L2/L3:     " << m.currentL1 << " / " << m.currentL2 << " / " << m.currentL3 << " A\n";
     std::cout << "Spanning L1-N/L2-N/L3-N: " << m.voltageL1N << " / " << m.voltageL2N << " / " << m.voltageL3N << " V\n";
     std::cout << "Spanning L1-L2/L2-L3/L3-L1: " << m.voltageL1L2 << " / " << m.voltageL2L3 << " / " << m.voltageL3L1 << " V\n";
     std::cout << "Vermogen P1/P2/P3:    " << m.activePowerL1 << " / " << m.activePowerL2 << " / " << m.activePowerL3 << " kW\n";
@@ -66,25 +74,18 @@ int main()
     controller.pollOnce();
     printMeasurement(controller.getLatestMeasurement());
 
-    // --- Optie 2: automatische poll-loop met callback -------------------------
-    controller.onMeasurement([](const MeterMeasurement& m) {
-        printMeasurement(m);
-    });
+    // --- Optie 2: Automatic polling with callback
+    controller.onMeasurement([](const MeterMeasurement &m)
+                             { printMeasurement(m); });
 
-    std::cout << "\n[start] Poll-loop gestart (elke 2 seconden)...\n";
+    std::cout.flush();
     controller.start();
 
-    // Laat de loop 10 seconden draaien
-    std::this_thread::sleep_for(std::chrono::seconds(10));
+    // Run for 3 seconds
+    std::this_thread::sleep_for(std::chrono::seconds(3));
 
-    // --- Laatste meting opvragen terwijl loop draait -------------------------
-    MeterMeasurement latest = controller.getLatestMeasurement();
-    std::cout << "\n[getLatestMeasurement] Laatste bekende frequentie: "
-              << latest.frequency << " Hz\n";
-
-    // --- Stoppen --------------------------------------------------------------
+    // Stop
     controller.stop();
-    std::cout << "\n[stop] Poll-loop gestopt\n";
 
     flogLld.disconnect();
     meterLld.disconnect();
