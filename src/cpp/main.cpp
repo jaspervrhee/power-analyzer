@@ -22,6 +22,15 @@ using SerialImpl = ModbusRtuSerial;
 #include <iostream>
 #include <chrono>
 #include <thread>
+#include <csignal>
+
+// Signal flag used when running until Ctrl-C
+static volatile std::sig_atomic_t keepRunning = 1;
+
+static void handleSigint(int /*sig*/)
+{
+    keepRunning = 0;
+}
 
 static void printMeasurement(const MeterMeasurement &m)
 {
@@ -41,31 +50,34 @@ static void printMeasurement(const MeterMeasurement &m)
     std::cout << "Frequentie:           " << m.frequency << " Hz\n";
 }
 
-int main()
+int main(int argc, char *argv[])
 {
     // --- Meter stack opbouwen -------------------------------------------------
-    SerialImpl  serial;
-    IEM3250LLD  meterLld(serial, "/dev/serial0", /*deviceId=*/1);
-    MeterHLD    meterHld(meterLld);
+    SerialImpl serial;
+    IEM3250LLD meterLld(serial, "/dev/serial0", /*deviceId=*/1);
+    MeterHLD meterHld(meterLld);
 
     // --- Log stack opbouwen ---------------------------------------------------
     // Meer backends? Maak een nieuw ILogBackend en voeg 'm toe met addBackend().
     FLOG_LLD flogLld{"134.188.254.132", 17540};
-    LogHLD   logHld;
+    LogHLD logHld;
     logHld.addBackend(flogLld);
 
     // --- Controller met beide services ---------------------------------------
-    Controller controller(meterHld, std::chrono::seconds(2));
+    // Polling interval: 1 second -> 1 Hz
+    Controller controller(meterHld, std::chrono::seconds(1));
     controller.setLogService(&logHld);
 
     // --- Verbindingen openen --------------------------------------------------
-    if (!meterLld.connect()) {
+    if (!meterLld.connect())
+    {
         std::cerr << "Kan niet verbinden met IEM3250\n";
         return 1;
     }
     std::cout << "Verbonden met IEM3250\n";
 
-    if (!flogLld.connect()) {
+    if (!flogLld.connect())
+    {
         std::cerr << "Waarschuwing: FLOG backend niet beschikbaar, logging uit.\n";
     }
 
@@ -82,7 +94,35 @@ int main()
     controller.start();
 
     // Run for 3 seconds
-    std::this_thread::sleep_for(std::chrono::seconds(3));
+    // Allow runtime control: optional first arg = seconds to run.
+    // If omitted, default to 3 seconds. If <= 0, run until Ctrl-C.
+    std::signal(SIGINT, handleSigint);
+
+    int runSeconds = 3;
+    if (argc > 1)
+    {
+        try
+        {
+            runSeconds = std::stoi(argv[1]);
+        }
+        catch (...)
+        {
+            runSeconds = 3;
+        }
+    }
+
+    if (runSeconds > 0)
+    {
+        std::this_thread::sleep_for(std::chrono::seconds(runSeconds));
+    }
+    else
+    {
+        std::cout << "Running until Ctrl-C (press Ctrl-C to stop)\n";
+        while (keepRunning)
+        {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    }
 
     // Stop
     controller.stop();

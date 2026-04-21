@@ -111,17 +111,18 @@ bool IEM3250LLD::readMeasurement(RawMeasurement &m)
     {
         // Schneider signed-PF on iEM3xxx: raw range [-2, 2], decode to [-1, 1].
         // |raw| > 1 indicates leading (capacitive) quadrant.
-        if (pfRaw > 1.0f)        m.powerFactor =  2.0f - pfRaw;
-        else if (pfRaw < -1.0f)  m.powerFactor = -2.0f - pfRaw;
-        else                     m.powerFactor = pfRaw;
+        if (pfRaw > 1.0f)
+            m.powerFactor = 2.0f - pfRaw;
+        else if (pfRaw < -1.0f)
+            m.powerFactor = -2.0f - pfRaw;
+        else
+            m.powerFactor = pfRaw;
     }
     else
     {
         ok = false;
     }
     ok &= readFloat32(Reg::FREQUENCY, m.frequency);
-
-
 
     return ok;
 }
