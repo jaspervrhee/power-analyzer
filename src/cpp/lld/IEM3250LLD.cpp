@@ -31,7 +31,10 @@ namespace Reg
     static constexpr uint16_t P3 = 3058;
     static constexpr uint16_t P_TOTAL = 3060;
 
-    static constexpr uint16_t PF = 3084;
+    // PF Total. iEM3250 layout places Power Factor Total at 3092;
+    // register 3084 is Apparent Power S Total (~121 VA), which was the
+    // cause of the out-of-range PF readings seen in the FLOG output.
+    static constexpr uint16_t PF = 3092;
     static constexpr uint16_t FREQUENCY = 3110;
 } // namespace Reg
 
@@ -125,10 +128,15 @@ bool IEM3250LLD::readFloat32(uint16_t regAddress, float &value)
     std::vector<uint16_t> regs;
     if (!comm_.readHoldingRegisters(modbusAddr, 2, regs))
     {
+        std::cerr << "[IEM3250] read failed @reg " << regAddress << '\n';
+        value = 0.0f;
         return false;
     }
     if (regs.size() < 2)
     {
+        std::cerr << "[IEM3250] short response @reg " << regAddress
+                  << " (got " << regs.size() << " words)\n";
+        value = 0.0f;
         return false;
     }
 
