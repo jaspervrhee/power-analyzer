@@ -26,6 +26,11 @@ void Controller::onMeasurement(MeasurementCallback callback)
     callback_ = std::move(callback);
 }
 
+void Controller::setLogService(ILogService* logService)
+{
+    logService_ = logService;
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
@@ -73,6 +78,10 @@ bool Controller::pollOnce()
     {
         std::lock_guard<std::mutex> lock(measurementMutex_);
         latestMeasurement_ = m;
+    }
+
+    if (logService_) {
+        logService_->logMeasurement(m);
     }
 
     if (ok && callback_) {

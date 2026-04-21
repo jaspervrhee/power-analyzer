@@ -1,5 +1,7 @@
 #include "lld/IEM3250LLD.h"
+#include "lld/FLOG_LLD.h"
 #include "hld/MeterHLD.h"
+#include "hld/LogHLD.h"
 #include "controller/Controller.h"
 
 #ifdef _WIN32
@@ -33,18 +35,31 @@ static void printMeasurement(const MeterMeasurement& m)
 
 int main()
 {
-    // --- Stack opbouwen -------------------------------------------------------
+    // --- Meter stack opbouwen -------------------------------------------------
     SerialImpl  serial;
-    IEM3250LLD  lld(serial, "/dev/serial0", /*deviceId=*/1);
-    MeterHLD        hld(lld);
-    Controller      controller(hld, std::chrono::seconds(2));
+    IEM3250LLD  meterLld(serial, "/dev/serial0", /*deviceId=*/1);
+    MeterHLD    meterHld(meterLld);
 
-    // --- Verbinding maken -----------------------------------------------------
-    if (!lld.connect()) {
+    // --- Log stack opbouwen ---------------------------------------------------
+    // Meer backends? Maak een nieuw ILogBackend en voeg 'm toe met addBackend().
+    FLOG_LLD flogLld{"134.188.254.132", 17540};
+    LogHLD   logHld;
+    logHld.addBackend(flogLld);
+
+    // --- Controller met beide services ---------------------------------------
+    Controller controller(meterHld, std::chrono::seconds(2));
+    controller.setLogService(&logHld);
+
+    // --- Verbindingen openen --------------------------------------------------
+    if (!meterLld.connect()) {
         std::cerr << "Kan niet verbinden met IEM3250\n";
         return 1;
     }
     std::cout << "Verbonden met IEM3250\n";
+
+    if (!flogLld.connect()) {
+        std::cerr << "Waarschuwing: FLOG backend niet beschikbaar, logging uit.\n";
+    }
 
     // --- Optie 1: eenmalig handmatig pollen -----------------------------------
     std::cout << "\n[pollOnce] Eenmalige meting:\n";
@@ -71,6 +86,7 @@ int main()
     controller.stop();
     std::cout << "\n[stop] Poll-loop gestopt\n";
 
-    lld.disconnect();
+    flogLld.disconnect();
+    meterLld.disconnect();
     return 0;
 }

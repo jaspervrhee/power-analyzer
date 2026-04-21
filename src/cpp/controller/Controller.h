@@ -1,6 +1,7 @@
 #pragma once
 
 #include "interfaces/IMeterService.h"
+#include "interfaces/ILogService.h"
 #include "common/MeterData.h"
 
 #include <atomic>
@@ -29,6 +30,13 @@ public:
                         std::chrono::milliseconds interval = std::chrono::seconds(1));
 
     ~Controller();
+
+    /**
+     * Attach a log service. When set, every valid measurement produced by
+     * the poll loop (and pollOnce) is forwarded to the log service.
+     * Passing nullptr detaches the current service.
+     */
+    void setLogService(ILogService* logService);
 
     // Non-copyable
     Controller(const Controller&)            = delete;
@@ -73,6 +81,7 @@ public:
 
 private:
     IMeterService&        meterService_;
+    ILogService*          logService_ = nullptr;
     std::chrono::milliseconds interval_;
     MeasurementCallback   callback_;
 

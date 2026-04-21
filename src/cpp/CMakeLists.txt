@@ -16,11 +16,15 @@ endif()
 add_library(power_analyzer_lib
     ${SERIAL_SRC}
     lld/IEM3250LLD.cpp
+    lld/FLOG_LLD.cpp
     hld/MeterHLD.cpp
+    hld/LogHLD.cpp
     controller/Controller.cpp
 )
 
-if(NOT WIN32)
+if(WIN32)
+    target_link_libraries(power_analyzer_lib PRIVATE ws2_32)
+else()
     target_link_libraries(power_analyzer_lib PRIVATE pthread)
 endif()
 
