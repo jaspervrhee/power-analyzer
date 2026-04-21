@@ -31,10 +31,9 @@ namespace Reg
     static constexpr uint16_t P3 = 3058;
     static constexpr uint16_t P_TOTAL = 3060;
 
-    // PF Total. iEM3250 layout places Power Factor Total at 3092;
-    // register 3084 is Apparent Power S Total (~121 VA), which was the
-    // cause of the out-of-range PF readings seen in the FLOG output.
-    static constexpr uint16_t PF = 3092;
+    // PF Total at register 3084. Schneider encodes signed PF on iEM3xxx
+    // in the range [-2, 2] to carry quadrant information (see decodeSignedPF).
+    static constexpr uint16_t PF = 3084;
     static constexpr uint16_t FREQUENCY = 3110;
 } // namespace Reg
 
@@ -107,7 +106,19 @@ bool IEM3250LLD::readMeasurement(RawMeasurement &m)
     ok &= readFloat32(Reg::P3, m.activePowerL3);
     ok &= readFloat32(Reg::P_TOTAL, m.totalActivePower);
 
-    ok &= readFloat32(Reg::PF, m.powerFactor);
+    float pfRaw = 0.0f;
+    if (readFloat32(Reg::PF, pfRaw))
+    {
+        // Schneider signed-PF on iEM3xxx: raw range [-2, 2], decode to [-1, 1].
+        // |raw| > 1 indicates leading (capacitive) quadrant.
+        if (pfRaw > 1.0f)        m.powerFactor =  2.0f - pfRaw;
+        else if (pfRaw < -1.0f)  m.powerFactor = -2.0f - pfRaw;
+        else                     m.powerFactor = pfRaw;
+    }
+    else
+    {
+        ok = false;
+    }
     ok &= readFloat32(Reg::FREQUENCY, m.frequency);
 
 
