@@ -1,5 +1,6 @@
 #include "hld/LogHLD.h"
 
+#include <cmath>
 #include <sstream>
 
 // ---------------------------------------------------------------------------
@@ -76,6 +77,12 @@ void LogHLD::dispatch(const LogEntry& entry)
 
 static std::string f2s(float v)
 {
+    // NaN/Inf and sub-microunit noise are treated as 0 so the FLOG output
+    // stays parseable by spreadsheets (no "nan" -> #NAAM? cells) and is
+    // not polluted by denormalised near-zero readings from the meter.
+    if (!std::isfinite(v) || std::fabs(v) < 1e-6f) {
+        return "0";
+    }
     std::ostringstream os;
     os << v;
     return os.str();
