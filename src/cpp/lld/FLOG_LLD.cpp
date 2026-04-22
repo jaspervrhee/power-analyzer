@@ -46,12 +46,36 @@ static void enableTcpKeepalive(NativeSocket sock)
     setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE,
                reinterpret_cast<const char*>(&one), sizeof(one));
 #ifdef __linux__
-    int idle  = 5;   // seconds idle before probes start
-    int intvl = 2;   // seconds between probes
-    int cnt   = 3;   // probes before the connection is declared dead
+    int idle  = 5;
+    int intvl = 2;
+    int cnt   = 3;
     setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle));
     setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
     setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
+
+    // TCP_USER_TIMEOUT: abort the connection when data has gone unacked for
+    // this many milliseconds. Keepalive only fires during *idle* periods; we
+    // send every 1s so the idle counter is constantly reset. Without this,
+    // a pulled cable takes tcp_retries2 (~15 min) to be noticed.
+#  ifdef TCP_USER_TIMEOUT
+    unsigned int userTimeoutMs = 10000;
+    if (setsockopt(sock, IPPROTO_TCP, TCP_USER_TIMEOUT,
+                   &userTimeoutMs, sizeof(userTimeoutMs)) == 0) {
+        std::cout << "[FLOG] TCP_USER_TIMEOUT=" << userTimeoutMs << "ms\n";
+    } else {
+        std::cerr << "[FLOG] TCP_USER_TIMEOUT setsockopt failed (errno="
+                  << errno << ")\n";
+    }
+#  else
+    std::cerr << "[FLOG] TCP_USER_TIMEOUT not available in headers\n";
+#  endif
+
+    // Shrink the send buffer so a stalled TCP connection applies
+    // back-pressure quickly: once the buffer is full, send() blocks and
+    // our SO_SNDTIMEO kicks in instead of the data silently piling up
+    // in the kernel for hundreds of seconds.
+    int sndbuf = 4096;
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 #endif
 }
 
