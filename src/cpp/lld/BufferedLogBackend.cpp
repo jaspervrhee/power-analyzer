@@ -81,22 +81,27 @@ void BufferedLogBackend::workerLoop()
     std::unique_lock<std::mutex> lock(queueMutex_);
 
     while (running_.load()) {
-        // Wake up on: new entry enqueued, shutdown, or reconnect tick.
+        // Whether it is the first iteration or a reconnect tick: make sure
+        // the wrapped backend is up before we try to drain anything.
+        if (!wrapped_.isConnected()) {
+            lock.unlock();
+            wrapped_.connect(); // failure is fine: we retry next tick
+            lock.lock();
+        }
+
+        // Wake up on:
+        //   - shutdown requested
+        //   - a new entry AND the wrapped backend is connected (i.e. we can
+        //     actually drain). This guard prevents a busy-loop when there are
+        //     pending entries but the downstream is still down: in that case
+        //     we fall through to the reconnectInterval_ timeout instead.
         queueCv_.wait_for(lock, reconnectInterval_, [this] {
-            return !running_.load() || !queue_.empty();
+            return !running_.load() ||
+                   (!queue_.empty() && wrapped_.isConnected());
         });
 
         if (!running_.load()) break;
-
-        // Ensure the wrapped backend is connected; if not, attempt a connect.
-        if (!wrapped_.isConnected()) {
-            lock.unlock();
-            wrapped_.connect(); // failure is fine: retry next tick
-            lock.lock();
-            if (!wrapped_.isConnected()) {
-                continue; // still down, wait another tick
-            }
-        }
+        if (!wrapped_.isConnected()) continue; // still down, retry connect
 
         // Drain the queue while we have work and the link stays up.
         while (running_.load() && !queue_.empty() && wrapped_.isConnected()) {

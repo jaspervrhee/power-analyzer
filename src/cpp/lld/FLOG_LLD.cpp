@@ -17,6 +17,7 @@ static int flogLastError() { return WSAGetLastError(); }
 #  include <arpa/inet.h>
 #  include <errno.h>
 #  include <netdb.h>
+#  include <netinet/tcp.h>
 #  include <sys/socket.h>
 #  include <unistd.h>
    using NativeSocket = int;
@@ -24,6 +25,25 @@ static int flogLastError() { return WSAGetLastError(); }
 #  define FLOG_CLOSE(s)       ::close(s)
 static int flogLastError() { return errno; }
 #endif
+
+// Enable aggressive TCP keepalive so a dead link (cable pulled, server killed)
+// is detected in ~10s instead of the OS default (2h on Linux). Without this,
+// send() keeps queuing bytes in the kernel socket buffer and we never notice
+// we are offline.
+static void enableTcpKeepalive(NativeSocket sock)
+{
+    int one = 1;
+    setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE,
+               reinterpret_cast<const char*>(&one), sizeof(one));
+#ifdef __linux__
+    int idle  = 5;   // seconds idle before probes start
+    int intvl = 2;   // seconds between probes
+    int cnt   = 3;   // probes before the connection is declared dead
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle));
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
+#endif
+}
 
 namespace {
 
@@ -126,6 +146,8 @@ bool FLOG_LLD::connect()
 #endif
         return false;
     }
+
+    enableTcpKeepalive(sock);
 
     socketFd_ = static_cast<std::int64_t>(sock);
     tableRefs_.clear();
