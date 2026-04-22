@@ -16,15 +16,25 @@ static int flogLastError() { return WSAGetLastError(); }
 #else
 #  include <arpa/inet.h>
 #  include <errno.h>
+#  include <fcntl.h>
 #  include <netdb.h>
 #  include <netinet/tcp.h>
+#  include <sys/select.h>
 #  include <sys/socket.h>
+#  include <sys/time.h>
 #  include <unistd.h>
    using NativeSocket = int;
 #  define FLOG_INVALID_SOCKET (-1)
 #  define FLOG_CLOSE(s)       ::close(s)
 static int flogLastError() { return errno; }
 #endif
+
+// Connect must not block the worker thread for the full OS SYN-retry timeout
+// (~2 min on Linux) when the server is unreachable. We use a non-blocking
+// connect with select() so we fail fast and can retry on the next tick.
+static constexpr int CONNECT_TIMEOUT_SEC = 2;
+// Caps how long a single send() call can block on a half-dead socket.
+static constexpr int SEND_TIMEOUT_MS     = 5000;
 
 // Enable aggressive TCP keepalive so a dead link (cable pulled, server killed)
 // is detected in ~10s instead of the OS default (2h on Linux). Without this,
@@ -43,6 +53,86 @@ static void enableTcpKeepalive(NativeSocket sock)
     setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
     setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
 #endif
+}
+
+// Cap single send() calls so a half-dead socket cannot hang the worker.
+static void enableSendTimeout(NativeSocket sock, int timeoutMs)
+{
+#ifdef _WIN32
+    const DWORD timeout = static_cast<DWORD>(timeoutMs);
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO,
+               reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+#else
+    timeval tv{};
+    tv.tv_sec  = timeoutMs / 1000;
+    tv.tv_usec = (timeoutMs % 1000) * 1000;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+}
+
+static bool setNonBlocking(NativeSocket sock, bool nonBlocking)
+{
+#ifdef _WIN32
+    u_long mode = nonBlocking ? 1u : 0u;
+    return ioctlsocket(sock, FIONBIO, &mode) == 0;
+#else
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags == -1) return false;
+    flags = nonBlocking ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK);
+    return fcntl(sock, F_SETFL, flags) == 0;
+#endif
+}
+
+// Issue connect() non-blocking and wait at most timeoutSec for completion.
+// Returns true iff the connection is established; leaves the socket in
+// blocking mode on success.
+static bool tryConnectWithTimeout(NativeSocket sock,
+                                  const sockaddr* addr,
+                                  std::size_t addrLen,
+                                  int timeoutSec)
+{
+    if (!setNonBlocking(sock, true)) return false;
+
+    const int rc = ::connect(sock, addr, static_cast<int>(addrLen));
+    if (rc == 0) {
+        return setNonBlocking(sock, false);
+    }
+
+#ifdef _WIN32
+    const bool inProgress = (WSAGetLastError() == WSAEWOULDBLOCK);
+#else
+    const bool inProgress = (errno == EINPROGRESS);
+#endif
+    if (!inProgress) return false;
+
+    fd_set wfds;
+    FD_ZERO(&wfds);
+    FD_SET(sock, &wfds);
+    timeval tv{};
+    tv.tv_sec  = timeoutSec;
+    tv.tv_usec = 0;
+
+#ifdef _WIN32
+    const int selectRc = select(0, nullptr, &wfds, nullptr, &tv);
+#else
+    const int selectRc = select(static_cast<int>(sock) + 1,
+                                nullptr, &wfds, nullptr, &tv);
+#endif
+    if (selectRc <= 0) return false; // timeout or select error
+
+    int soError = 0;
+#ifdef _WIN32
+    int optLen = sizeof(soError);
+#else
+    socklen_t optLen = sizeof(soError);
+#endif
+    if (getsockopt(sock, SOL_SOCKET, SO_ERROR,
+                   reinterpret_cast<char*>(&soError), &optLen) != 0) {
+        return false;
+    }
+    if (soError != 0) return false;
+
+    return setNonBlocking(sock, false);
 }
 
 namespace {
@@ -128,13 +218,14 @@ bool FLOG_LLD::connect()
 
     NativeSocket sock = FLOG_INVALID_SOCKET;
     for (addrinfo* a = res; a != nullptr; a = a->ai_next) {
-        sock = ::socket(a->ai_family, a->ai_socktype, a->ai_protocol);
-        if (sock == FLOG_INVALID_SOCKET) continue;
-        if (::connect(sock, a->ai_addr, static_cast<int>(a->ai_addrlen)) == 0) {
+        NativeSocket s = ::socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+        if (s == FLOG_INVALID_SOCKET) continue;
+        if (tryConnectWithTimeout(s, a->ai_addr, a->ai_addrlen,
+                                  CONNECT_TIMEOUT_SEC)) {
+            sock = s;
             break;
         }
-        FLOG_CLOSE(sock);
-        sock = FLOG_INVALID_SOCKET;
+        FLOG_CLOSE(s);
     }
     freeaddrinfo(res);
 
@@ -148,6 +239,7 @@ bool FLOG_LLD::connect()
     }
 
     enableTcpKeepalive(sock);
+    enableSendTimeout(sock, SEND_TIMEOUT_MS);
 
     socketFd_ = static_cast<std::int64_t>(sock);
     tableRefs_.clear();
