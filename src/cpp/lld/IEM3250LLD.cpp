@@ -7,12 +7,10 @@
 #include <thread>
 #include <utility>
 
-// Transient Modbus glitches (timeout / short response) are recoverable when
-// polling at 1 Hz on a 50 Hz grid: there is ample slack to retry before the
-// next poll cycle. Give each register up to MAX_ATTEMPTS tries with a short
-// pause between them before we consider the read truly failed.
-static constexpr int  MAX_ATTEMPTS         = 3;
-static constexpr auto RETRY_DELAY          = std::chrono::milliseconds(30);
+
+
+static constexpr int  MAX_ATTEMPTS         = 5;
+static constexpr auto RETRY_DELAY          = std::chrono::milliseconds(80);
 
 // ---------------------------------------------------------------------------
 // IEM3250 Modbus register addresses (Schneider numbering)
