@@ -97,16 +97,28 @@ bool Controller::pollOnce()
 
 void Controller::pollLoop()
 {
+    // Schedule on an absolute clock so poll duration doesn't leak into the
+    // period: period == interval_ regardless of how long pollOnce() took.
+    auto nextTick = std::chrono::steady_clock::now();
+
     while (running_.load()) {
         pollOnce();
 
-        // Sleep in small increments so stop() is responsive.
+        nextTick += interval_;
+
+        // If pollOnce overran (bus unhealthy, heavy retries), skip missed
+        // ticks instead of machine-gunning catch-up polls.
+        const auto now = std::chrono::steady_clock::now();
+        if (nextTick < now) {
+            nextTick = now;
+        }
+
+        // Sleep in small increments so stop() stays responsive.
         const auto step = std::chrono::milliseconds(50);
-        auto remaining  = interval_;
-        while (running_.load() && remaining > std::chrono::milliseconds(0)) {
-            const auto sleep = remaining < step ? remaining : step;
-            std::this_thread::sleep_for(sleep);
-            remaining -= sleep;
+        while (running_.load()) {
+            const auto remaining = nextTick - std::chrono::steady_clock::now();
+            if (remaining <= std::chrono::milliseconds(0)) break;
+            std::this_thread::sleep_for(remaining < step ? remaining : step);
         }
     }
 }

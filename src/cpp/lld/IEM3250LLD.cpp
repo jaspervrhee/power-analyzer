@@ -9,8 +9,8 @@
 
 
 
-static constexpr int  MAX_ATTEMPTS         = 5;
-static constexpr auto RETRY_DELAY          = std::chrono::milliseconds(80);
+static constexpr int  MAX_ATTEMPTS         = 3;
+static constexpr auto RETRY_DELAY          = std::chrono::milliseconds(40);
 
 // ---------------------------------------------------------------------------
 // IEM3250 Modbus register addresses (Schneider numbering)
