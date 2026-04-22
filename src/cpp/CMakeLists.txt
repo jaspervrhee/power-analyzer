@@ -17,6 +17,7 @@ add_library(power_analyzer_lib
     ${SERIAL_SRC}
     lld/IEM3250LLD.cpp
     lld/FLOG_LLD.cpp
+    lld/BufferedLogBackend.cpp
     hld/MeterHLD.cpp
     hld/LogHLD.cpp
     controller/Controller.cpp

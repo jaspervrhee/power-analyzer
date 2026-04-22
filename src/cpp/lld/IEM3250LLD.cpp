@@ -1,9 +1,18 @@
 #include "lld/IEM3250LLD.h"
 
+#include <chrono>
 #include <cstring>
 #include <iostream>
 #include <iomanip>
+#include <thread>
 #include <utility>
+
+// Transient Modbus glitches (timeout / short response) are recoverable when
+// polling at 1 Hz on a 50 Hz grid: there is ample slack to retry before the
+// next poll cycle. Give each register up to MAX_ATTEMPTS tries with a short
+// pause between them before we consider the read truly failed.
+static constexpr int  MAX_ATTEMPTS         = 3;
+static constexpr auto RETRY_DELAY          = std::chrono::milliseconds(30);
 
 // ---------------------------------------------------------------------------
 // IEM3250 Modbus register addresses (Schneider numbering)
@@ -137,25 +146,30 @@ bool IEM3250LLD::readFloat32(uint16_t regAddress, float &value)
     const auto modbusAddr = static_cast<uint16_t>(
         static_cast<int>(regAddress) + MODBUS_OFFSET);
 
-    std::vector<uint16_t> regs;
-    if (!comm_.readHoldingRegisters(modbusAddr, 2, regs))
+    for (int attempt = 1; attempt <= MAX_ATTEMPTS; ++attempt)
     {
-        std::cerr << "[IEM3250] read failed @reg " << regAddress << '\n';
-        value = 0.0f;
-        return false;
-    }
-    if (regs.size() < 2)
-    {
-        std::cerr << "[IEM3250] short response @reg " << regAddress
-                  << " (got " << regs.size() << " words)\n";
-        value = 0.0f;
-        return false;
+        std::vector<uint16_t> regs;
+        const bool transportOk = comm_.readHoldingRegisters(modbusAddr, 2, regs);
+
+        if (transportOk && regs.size() >= 2)
+        {
+            // regs[0] = first register (CDAB: holds bytes C,D — low word)
+            // regs[1] = second register (CDAB: holds bytes A,B — high word)
+            value = decodeCDAB(regs[0], regs[1]);
+            return true;
+        }
+
+        if (attempt < MAX_ATTEMPTS)
+        {
+            std::this_thread::sleep_for(RETRY_DELAY);
+        }
     }
 
-    // regs[0] = first register (CDAB: holds bytes C,D — low word)
-    // regs[1] = second register (CDAB: holds bytes A,B — high word)
-    value = decodeCDAB(regs[0], regs[1]);
-    return true;
+    // All attempts exhausted — log once and give up on this register for this poll.
+    std::cerr << "[IEM3250] read failed @reg " << regAddress
+              << " after " << MAX_ATTEMPTS << " attempts\n";
+    value = 0.0f;
+    return false;
 }
 
 float IEM3250LLD::decodeCDAB(uint16_t regLow, uint16_t regHigh)

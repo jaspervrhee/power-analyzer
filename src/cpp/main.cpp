@@ -1,5 +1,6 @@
 #include "lld/IEM3250LLD.h"
 #include "lld/FLOG_LLD.h"
+#include "lld/BufferedLogBackend.h"
 #include "hld/MeterHLD.h"
 #include "hld/LogHLD.h"
 #include "controller/Controller.h"
@@ -58,10 +59,13 @@ int main(int argc, char *argv[])
     MeterHLD meterHld(meterLld);
 
     // --- Log stack opbouwen ---------------------------------------------------
+    // FLOG zit achter een buffer: valt de logServer weg, dan blijven we meten
+    // en loggen we alles na zodra de verbinding terug is.
     // Meer backends? Maak een nieuw ILogBackend en voeg 'm toe met addBackend().
-    FLOG_LLD flogLld{"134.188.254.132", 17540};
-    LogHLD logHld;
-    logHld.addBackend(flogLld);
+    FLOG_LLD           flogLld{"134.188.254.132", 17540};
+    BufferedLogBackend bufferedFlog{flogLld};
+    LogHLD             logHld;
+    logHld.addBackend(bufferedFlog);
 
     // --- Controller met beide services ---------------------------------------
     // Polling interval: 1 second -> 1 Hz
@@ -76,10 +80,9 @@ int main(int argc, char *argv[])
     }
     std::cout << "Verbonden met IEM3250\n";
 
-    if (!flogLld.connect())
-    {
-        std::cerr << "Waarschuwing: FLOG backend niet beschikbaar, logging uit.\n";
-    }
+    // Start de buffer-worker: die probeert zelf te (re)connecten met FLOG.
+    // Het systeem draait sowieso door, ook als de logServer nu offline is.
+    bufferedFlog.connect();
 
     // --- Optie 1: eenmalig handmatig pollen -----------------------------------
     std::cout << "\n[pollOnce] Eenmalige meting:\n";
@@ -127,7 +130,8 @@ int main(int argc, char *argv[])
     // Stop
     controller.stop();
 
-    flogLld.disconnect();
+    // bufferedFlog.disconnect() stopt de worker-thread én disconnect'et de FLOG.
+    bufferedFlog.disconnect();
     meterLld.disconnect();
     return 0;
 }
