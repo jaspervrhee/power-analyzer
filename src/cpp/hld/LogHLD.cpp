@@ -1,6 +1,8 @@
 #include "hld/LogHLD.h"
 
 #include <cmath>
+#include <ctime>
+#include <iomanip>
 #include <sstream>
 
 // ---------------------------------------------------------------------------
@@ -75,6 +77,30 @@ void LogHLD::dispatch(const LogEntry& entry)
     }
 }
 
+// Format the measurement timestamp as "YYYY-MM-DD HH:MM:SS.mmm" — Excel/CSV
+// readers parse this directly as a date-time. Local time is used so the
+// column matches the operator's wall clock; if the Pi's TZ is UTC the values
+// will be UTC, which is fine as long as it's consistent.
+static std::string formatTimestamp(std::chrono::system_clock::time_point tp)
+{
+    using namespace std::chrono;
+    if (tp.time_since_epoch().count() == 0) {
+        return "";
+    }
+    const auto t   = system_clock::to_time_t(tp);
+    const auto ms  = duration_cast<milliseconds>(tp.time_since_epoch()) % 1000;
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    std::ostringstream os;
+    os << std::put_time(&tm, "%Y-%m-%d %H:%M:%S")
+       << '.' << std::setw(3) << std::setfill('0') << ms.count();
+    return os.str();
+}
+
 static std::string f2s(float v)
 {
     // NaN/Inf and sub-microunit noise are treated as 0 so the FLOG output
@@ -93,6 +119,7 @@ void LogHLD::fillMeasurementRow(const MeterMeasurement& m,
                                 std::vector<std::string>& values)
 {
     columns = {
+        "t_meas",
         "valid",
         "I1", "I2", "I3", "Iavg",
         "U1N", "U2N", "U3N", "ULNavg",
@@ -101,6 +128,7 @@ void LogHLD::fillMeasurementRow(const MeterMeasurement& m,
         "PF", "f"
     };
     values = {
+        formatTimestamp(m.measuredAt),
         m.valid ? "1" : "0",
         f2s(m.currentL1),    f2s(m.currentL2),    f2s(m.currentL3),    f2s(m.currentAvg),
         f2s(m.voltageL1N),   f2s(m.voltageL2N),   f2s(m.voltageL3N),   f2s(m.voltageLNAvg),

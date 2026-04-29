@@ -121,6 +121,7 @@ MeterMeasurement MeterHLD::toMeterMeasurement(const RawMeasurement &r, bool vali
 {
     MeterMeasurement m{};
     m.valid = valid;
+    m.measuredAt = r.measuredAt;
 
     m.currentL1 = r.currentL1;
     m.currentL2 = r.currentL2;

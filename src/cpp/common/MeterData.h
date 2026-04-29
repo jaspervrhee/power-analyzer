@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 
 /**
@@ -7,6 +8,11 @@
  * Values are technically correct but not yet validated or interpreted.
  */
 struct RawMeasurement {
+    // Wall-clock time at which the LLD started reading this sample.
+    // Captured before the Modbus reads so it reflects the measurement moment,
+    // not when the row eventually reaches the log backend.
+    std::chrono::system_clock::time_point measuredAt;
+
     float currentL1;       // I1  [A]
     float currentL2;       // I2  [A]
     float currentL3;       // I3  [A]
@@ -36,6 +42,11 @@ struct RawMeasurement {
  * (MeterHLD → Controller). Hardware and protocol details are fully hidden.
  */
 struct MeterMeasurement {
+    // Same as RawMeasurement::measuredAt — propagated through validation so
+    // logging can write the actual measurement timestamp instead of the log
+    // dispatch time.
+    std::chrono::system_clock::time_point measuredAt;
+
     float currentL1;
     float currentL2;
     float currentL3;
