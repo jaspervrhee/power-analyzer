@@ -154,6 +154,7 @@ bool IEM3250LLD::readFloat32(uint16_t regAddress, float &value)
             // regs[0] = first register (CDAB: holds bytes C,D — low word)
             // regs[1] = second register (CDAB: holds bytes A,B — high word)
             value = decodeCDAB(regs[0], regs[1]);
+            lastGood_[regAddress] = value;
             return true;
         }
 
@@ -163,9 +164,24 @@ bool IEM3250LLD::readFloat32(uint16_t regAddress, float &value)
         }
     }
 
-    // All attempts exhausted — log once and give up on this register for this poll.
+    // All attempts exhausted. Fall back to the last successfully decoded
+    // value for this register so the logged row never carries a placeholder
+    // 0 — the requirement is that every column holds a plausible value.
+    auto it = lastGood_.find(regAddress);
+    if (it != lastGood_.end())
+    {
+        std::cerr << "[IEM3250] read failed @reg " << regAddress
+                  << " after " << MAX_ATTEMPTS
+                  << " attempts — holding last known good value\n";
+        value = it->second;
+        return true;
+    }
+
+    // No prior sample yet (failure during the very first poll for this reg):
+    // signal failure so the row is logged as invalid rather than as zeros.
     std::cerr << "[IEM3250] read failed @reg " << regAddress
-              << " after " << MAX_ATTEMPTS << " attempts\n";
+              << " after " << MAX_ATTEMPTS
+              << " attempts and no cached value — marking measurement invalid\n";
     value = 0.0f;
     return false;
 }

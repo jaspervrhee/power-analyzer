@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 
 /**
  * IEM3250_LLD — Low Level Driver for the Schneider iEM3250 energy meter.
@@ -46,6 +47,13 @@ private:
     int deviceId_;
     int baudRate_;
     int timeoutMs_;
+
+    // Per-register last successfully decoded value. Used as a hold-over when
+    // a single register read fails after all retries, so the row never gets
+    // a placeholder 0 written into it. The 50 Hz grid changes slowly compared
+    // to our 1 Hz cadence, so reusing the previous sample for one cycle is a
+    // safe approximation while the bus recovers.
+    std::unordered_map<uint16_t, float> lastGood_;
 
     /**
      * Read a single float32 value from two consecutive IEM3250 registers.
