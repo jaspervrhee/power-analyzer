@@ -91,6 +91,11 @@ bool IEM3250LLD::readMeasurement(RawMeasurement &m)
         return false;
     }
 
+    // Stamp the moment the sample starts. The Modbus burst takes hundreds of
+    // ms; the consumer cares when the grid was sampled, not when the row was
+    // logged.
+    m.measuredAt = std::chrono::system_clock::now();
+
     bool ok = true;
 
     ok &= readFloat32(Reg::I1, m.currentL1);
