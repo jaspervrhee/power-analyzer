@@ -12,6 +12,16 @@
 static constexpr int  MAX_ATTEMPTS         = 3;
 static constexpr auto RETRY_DELAY          = std::chrono::milliseconds(40);
 
+// Sentinel written to a column when its burst read fails after all retries.
+// Chosen to be visually distinct and outside the plausible physical range
+// for currents (≥0 A), voltages (≥0 V) and frequency (45-65 Hz). Active power
+// can legitimately be negative (grid feed-in), but -9999 kW lies far outside
+// the expected operating range for this installation, so the sentinel still
+// stands out clearly. The row's `valid` flag (set to 0 on any fallback) is
+// the authoritative invalid-marker; the sentinel just makes failed samples
+// immediately recognizable when inspecting the data in a spreadsheet.
+static constexpr float INVALID_SENTINEL = -9999.0f;
+
 // ---------------------------------------------------------------------------
 // IEM3250 Modbus register addresses (Schneider numbering)
 // Each float32 value occupies 2 consecutive 16-bit registers.
@@ -39,7 +49,7 @@ namespace Reg
     static constexpr uint16_t P_TOTAL = 3060;
 
     // PF Total at register 3084. Schneider encodes signed PF on iEM3xxx
-    // in the range [-2, 2] to carry quadrant information (see decodeSignedPF).
+    // in the range [-2, 2] to carry quadrant information (see decode below).
     static constexpr uint16_t PF = 3084;
     static constexpr uint16_t FREQUENCY = 3110;
 } // namespace Reg
@@ -96,45 +106,71 @@ bool IEM3250LLD::readMeasurement(RawMeasurement &m)
     // logged.
     m.measuredAt = std::chrono::system_clock::now();
 
+    // ok stays true only if every burst returned FRESH data. Any failure
+    // flips it to false so the row is logged with valid=0 and the failed
+    // columns carry the sentinel value.
     bool ok = true;
 
-    ok &= readFloat32(Reg::I1, m.currentL1);
-    ok &= readFloat32(Reg::I2, m.currentL2);
-    ok &= readFloat32(Reg::I3, m.currentL3);
-    ok &= readFloat32(Reg::I_AVG, m.currentAvg);
+    // Burst 1 — currents (registers 3000..3011, 6 float pairs of which 4 used).
+    ok &= readBurst(Reg::I1, 12, {
+        {Reg::I1,    0,  &m.currentL1},
+        {Reg::I2,    2,  &m.currentL2},
+        {Reg::I3,    4,  &m.currentL3},
+        {Reg::I_AVG, 10, &m.currentAvg},
+    });
 
-    ok &= readFloat32(Reg::U12, m.voltageL1L2);
-    ok &= readFloat32(Reg::U23, m.voltageL2L3);
-    ok &= readFloat32(Reg::U31, m.voltageL3L1);
-    ok &= readFloat32(Reg::U_LL_AVG, m.voltageLLAvg);
+    // Burst 2 — line-line and line-neutral voltages (3020..3037).
+    ok &= readBurst(Reg::U12, 18, {
+        {Reg::U12,      0,  &m.voltageL1L2},
+        {Reg::U23,      2,  &m.voltageL2L3},
+        {Reg::U31,      4,  &m.voltageL3L1},
+        {Reg::U_LL_AVG, 6,  &m.voltageLLAvg},
+        {Reg::U1N,      8,  &m.voltageL1N},
+        {Reg::U2N,      10, &m.voltageL2N},
+        {Reg::U3N,      12, &m.voltageL3N},
+        {Reg::U_LN_AVG, 16, &m.voltageLNAvg},
+    });
 
-    ok &= readFloat32(Reg::U1N, m.voltageL1N);
-    ok &= readFloat32(Reg::U2N, m.voltageL2N);
-    ok &= readFloat32(Reg::U3N, m.voltageL3N);
-    ok &= readFloat32(Reg::U_LN_AVG, m.voltageLNAvg);
+    // Burst 3 — active powers (3054..3061).
+    ok &= readBurst(Reg::P1, 8, {
+        {Reg::P1,      0, &m.activePowerL1},
+        {Reg::P2,      2, &m.activePowerL2},
+        {Reg::P3,      4, &m.activePowerL3},
+        {Reg::P_TOTAL, 6, &m.totalActivePower},
+    });
 
-    ok &= readFloat32(Reg::P1, m.activePowerL1);
-    ok &= readFloat32(Reg::P2, m.activePowerL2);
-    ok &= readFloat32(Reg::P3, m.activePowerL3);
-    ok &= readFloat32(Reg::P_TOTAL, m.totalActivePower);
-
+    // Burst 4 — power factor (single float). We decode the Schneider sign
+    // convention here: raw range [-2, 2] carries the quadrant; |raw| > 1
+    // indicates leading (capacitive) operation. Normalised PF stays in [-1, 1].
+    // On burst failure the sentinel passes through the decode untouched
+    // (|sentinel| > 1) which would corrupt the displayed value, so we route
+    // around it explicitly.
     float pfRaw = 0.0f;
-    if (readFloat32(Reg::PF, pfRaw))
+    const bool pfFresh = readBurst(Reg::PF, 2, {
+        {Reg::PF, 0, &pfRaw},
+    });
+    if (!pfFresh)
     {
-        // Schneider signed-PF on iEM3xxx: raw range [-2, 2], decode to [-1, 1].
-        // |raw| > 1 indicates leading (capacitive) quadrant.
-        if (pfRaw > 1.0f)
-            m.powerFactor = 2.0f - pfRaw;
-        else if (pfRaw < -1.0f)
-            m.powerFactor = -2.0f - pfRaw;
-        else
-            m.powerFactor = pfRaw;
+        m.powerFactor = INVALID_SENTINEL;
+    }
+    else if (pfRaw > 1.0f)
+    {
+        m.powerFactor = 2.0f - pfRaw;
+    }
+    else if (pfRaw < -1.0f)
+    {
+        m.powerFactor = -2.0f - pfRaw;
     }
     else
     {
-        ok = false;
+        m.powerFactor = pfRaw;
     }
-    ok &= readFloat32(Reg::FREQUENCY, m.frequency);
+    ok &= pfFresh;
+
+    // Burst 5 — frequency.
+    ok &= readBurst(Reg::FREQUENCY, 2, {
+        {Reg::FREQUENCY, 0, &m.frequency},
+    });
 
     return ok;
 }
@@ -143,23 +179,27 @@ bool IEM3250LLD::readMeasurement(RawMeasurement &m)
 // Private helpers
 // ---------------------------------------------------------------------------
 
-bool IEM3250LLD::readFloat32(uint16_t regAddress, float &value)
+bool IEM3250LLD::readBurst(uint16_t startRegAddr,
+                           uint16_t regCount,
+                           std::initializer_list<FloatExtract> extracts)
 {
-    // Apply the IEM3250 Modbus address offset
+    // Apply the IEM3250 Modbus address offset on the burst's start address.
     const auto modbusAddr = static_cast<uint16_t>(
-        static_cast<int>(regAddress) + MODBUS_OFFSET);
+        static_cast<int>(startRegAddr) + MODBUS_OFFSET);
 
     for (int attempt = 1; attempt <= MAX_ATTEMPTS; ++attempt)
     {
         std::vector<uint16_t> regs;
-        const bool transportOk = comm_.readHoldingRegisters(modbusAddr, 2, regs);
+        const bool transportOk = comm_.readHoldingRegisters(modbusAddr, regCount, regs);
 
-        if (transportOk && regs.size() >= 2)
+        if (transportOk && regs.size() >= regCount)
         {
-            // regs[0] = first register (CDAB: holds bytes C,D — low word)
-            // regs[1] = second register (CDAB: holds bytes A,B — high word)
-            value = decodeCDAB(regs[0], regs[1]);
-            lastGood_[regAddress] = value;
+            // Fresh burst — decode every requested float.
+            for (const auto& ext : extracts)
+            {
+                *ext.outValue = decodeCDAB(regs[ext.offsetInBlock],
+                                           regs[ext.offsetInBlock + 1]);
+            }
             return true;
         }
 
@@ -169,25 +209,17 @@ bool IEM3250LLD::readFloat32(uint16_t regAddress, float &value)
         }
     }
 
-    // All attempts exhausted. Fall back to the last successfully decoded
-    // value for this register so the logged row never carries a placeholder
-    // 0 — the requirement is that every column holds a plausible value.
-    auto it = lastGood_.find(regAddress);
-    if (it != lastGood_.end())
+    // All attempts exhausted. Fill every requested float with the sentinel
+    // so downstream tooling can filter the bad sample by value, not just by
+    // the row's `valid` flag.
+    std::cerr << "[IEM3250] burst @reg " << startRegAddr
+              << " failed after " << MAX_ATTEMPTS
+              << " attempts — writing sentinel " << INVALID_SENTINEL
+              << " for " << extracts.size() << " column(s)\n";
+    for (const auto& ext : extracts)
     {
-        std::cerr << "[IEM3250] read failed @reg " << regAddress
-                  << " after " << MAX_ATTEMPTS
-                  << " attempts — holding last known good value\n";
-        value = it->second;
-        return true;
+        *ext.outValue = INVALID_SENTINEL;
     }
-
-    // No prior sample yet (failure during the very first poll for this reg):
-    // signal failure so the row is logged as invalid rather than as zeros.
-    std::cerr << "[IEM3250] read failed @reg " << regAddress
-              << " after " << MAX_ATTEMPTS
-              << " attempts and no cached value — marking measurement invalid\n";
-    value = 0.0f;
     return false;
 }
 
