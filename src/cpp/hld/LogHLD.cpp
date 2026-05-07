@@ -50,7 +50,7 @@ void LogHLD::logMeasurement(const MeterMeasurement& measurement)
     LogEntry entry;
     entry.timestamp = std::chrono::system_clock::now();
     entry.level     = measurement.valid ? LogLevel::Info : LogLevel::Warning;
-    entry.tablePath = "functional/power";
+    entry.tablePath = "power";
     entry.tableName = "measurements";
     fillMeasurementRow(measurement, entry.columns, entry.values);
 

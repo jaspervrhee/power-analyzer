@@ -29,17 +29,11 @@ static int flogLastError() { return WSAGetLastError(); }
 static int flogLastError() { return errno; }
 #endif
 
-// Connect must not block the worker thread for the full OS SYN-retry timeout
-// (~2 min on Linux) when the server is unreachable. We use a non-blocking
-// connect with select() so we fail fast and can retry on the next tick.
+
 static constexpr int CONNECT_TIMEOUT_SEC = 2;
 // Caps how long a single send() call can block on a half-dead socket.
 static constexpr int SEND_TIMEOUT_MS     = 5000;
 
-// Enable aggressive TCP keepalive so a dead link (cable pulled, server killed)
-// is detected in ~10s instead of the OS default (2h on Linux). Without this,
-// send() keeps queuing bytes in the kernel socket buffer and we never notice
-// we are offline.
 static void enableTcpKeepalive(NativeSocket sock)
 {
     int one = 1;
