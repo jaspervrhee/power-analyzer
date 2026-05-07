@@ -4,8 +4,8 @@
 #include "interfaces/IIEM3250Communication.h"
 
 #include <cstdint>
+#include <initializer_list>
 #include <string>
-#include <unordered_map>
 
 /**
  * IEM3250_LLD — Low Level Driver for the Schneider iEM3250 energy meter.
@@ -48,22 +48,32 @@ private:
     int baudRate_;
     int timeoutMs_;
 
-    // Per-register last successfully decoded value. Used as a hold-over when
-    // a single register read fails after all retries, so the row never gets
-    // a placeholder 0 written into it. The 50 Hz grid changes slowly compared
-    // to our 1 Hz cadence, so reusing the previous sample for one cycle is a
-    // safe approximation while the bus recovers.
-    std::unordered_map<uint16_t, float> lastGood_;
+    // One float32 to extract from a burst response.
+    //   regAddr        — Schneider register address (logged on failure).
+    //   offsetInBlock  — index of the LOW word inside the burst's reg vector.
+    //                    The HIGH word sits at offsetInBlock + 1.
+    //   outValue       — destination for the decoded float (or sentinel on fail).
+    struct FloatExtract {
+        uint16_t regAddr;
+        uint16_t offsetInBlock;
+        float*   outValue;
+    };
 
     /**
-     * Read a single float32 value from two consecutive IEM3250 registers.
-     * Applies the -2 Modbus address offset and decodes CDAB byte order.
+     * Read a contiguous register block in one Modbus transaction and decode
+     * the requested float32 values from CDAB pairs.
      *
-     * @param regAddress  Schneider register address (e.g. 3000 for I1).
-     * @param value       Output: decoded float value.
-     * @return true on success.
+     * On failure of the burst itself (after MAX_ATTEMPTS retries), each
+     * requested float is set to a clearly-invalid sentinel value so that
+     * downstream consumers (CSV/Excel/FLOG) can filter or visually identify
+     * failed samples. The row is also marked invalid via the return value.
+     *
+     * @return true iff every requested float came from a fresh burst.
+     *         false on any failure — output values are filled with sentinels.
      */
-    bool readFloat32(uint16_t regAddress, float& value);
+    bool readBurst(uint16_t startRegAddr,
+                   uint16_t regCount,
+                   std::initializer_list<FloatExtract> extracts);
 
     /**
      * Decode a CDAB-ordered float32 from two raw 16-bit register values.

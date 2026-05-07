@@ -119,7 +119,7 @@ void LogHLD::fillMeasurementRow(const MeterMeasurement& m,
                                 std::vector<std::string>& values)
 {
     columns = {
-        "t_meas",
+        "tMeas",
         "valid",
         "I1", "I2", "I3", "Iavg",
         "U1N", "U2N", "U3N", "ULNavg",
