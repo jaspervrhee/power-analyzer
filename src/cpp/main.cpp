@@ -63,7 +63,7 @@ int main(int argc, char *argv[])
     // en loggen we alles na zodra de verbinding terug is.
     // Meer backends? Maak een nieuw ILogBackend en voeg 'm toe met addBackend().
     FLOG_LLD           flogLld{"134.188.254.132", 17540};
-    BufferedLogBackend bufferedFlog{flogLld};
+    BufferedLogBackend bufferedFlog{flogLld, 100000};  // ~28h buffer at 1Hz, ~150MB RAM
     LogHLD             logHld;
     logHld.addBackend(bufferedFlog);
 
