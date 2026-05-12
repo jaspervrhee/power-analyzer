@@ -7,9 +7,9 @@
 #include <thread>
 #include <utility>
 
-static constexpr int  MAX_ATTEMPTS         = 5;
-static constexpr auto INTER_ATTEMPT_DELAY  = std::chrono::milliseconds(50);
-static constexpr float INVALID_SENTINEL    = -9999.0f;
+static constexpr int  MAX_ROUNDS         = 3;
+static constexpr auto INTER_ROUND_DELAY  = std::chrono::milliseconds(100);
+static constexpr float INVALID_SENTINEL  = -9999.0f;
 
 namespace Reg
 {
@@ -38,6 +38,18 @@ namespace Reg
 }
 
 static constexpr int MODBUS_OFFSET = -2;
+
+namespace {
+
+// One Modbus transaction reading exactly one float32 (= 2 registers).
+// On failure we put the index back at the end of the queue, giving it the
+// time of all other reads as natural backoff before the next attempt.
+struct SingleRead {
+    uint16_t regAddr;
+    float*   outValue;
+};
+
+}
 
 IEM3250LLD::IEM3250LLD(IIEM3250Communication &comm,
                        std::string port,
@@ -77,58 +89,69 @@ bool IEM3250LLD::readMeasurement(RawMeasurement &m)
 
     m.measuredAt = std::chrono::system_clock::now();
 
-    // One mega-burst covers all 18 floats: registers 3000..3111 (= 112 regs).
-    // Gaps (e.g. 3012-3019, 3038-3053) are read & discarded. At 38400 baud
-    // one full burst is ~80-100 ms, so MAX_ATTEMPTS retries fit easily in
-    // the 1 Hz budget (~700 ms worst case).
-    constexpr uint16_t startReg = Reg::I1;
-    constexpr uint16_t regCount = (Reg::FREQUENCY - Reg::I1) + 2;
-
-    const std::vector<FloatExtract> extracts = {
-        {Reg::I1,        static_cast<uint16_t>(Reg::I1        - startReg), &m.currentL1},
-        {Reg::I2,        static_cast<uint16_t>(Reg::I2        - startReg), &m.currentL2},
-        {Reg::I3,        static_cast<uint16_t>(Reg::I3        - startReg), &m.currentL3},
-        {Reg::I_AVG,     static_cast<uint16_t>(Reg::I_AVG     - startReg), &m.currentAvg},
-        {Reg::U12,       static_cast<uint16_t>(Reg::U12       - startReg), &m.voltageL1L2},
-        {Reg::U23,       static_cast<uint16_t>(Reg::U23       - startReg), &m.voltageL2L3},
-        {Reg::U31,       static_cast<uint16_t>(Reg::U31       - startReg), &m.voltageL3L1},
-        {Reg::U_LL_AVG,  static_cast<uint16_t>(Reg::U_LL_AVG  - startReg), &m.voltageLLAvg},
-        {Reg::U1N,       static_cast<uint16_t>(Reg::U1N       - startReg), &m.voltageL1N},
-        {Reg::U2N,       static_cast<uint16_t>(Reg::U2N       - startReg), &m.voltageL2N},
-        {Reg::U3N,       static_cast<uint16_t>(Reg::U3N       - startReg), &m.voltageL3N},
-        {Reg::U_LN_AVG,  static_cast<uint16_t>(Reg::U_LN_AVG  - startReg), &m.voltageLNAvg},
-        {Reg::P1,        static_cast<uint16_t>(Reg::P1        - startReg), &m.activePowerL1},
-        {Reg::P2,        static_cast<uint16_t>(Reg::P2        - startReg), &m.activePowerL2},
-        {Reg::P3,        static_cast<uint16_t>(Reg::P3        - startReg), &m.activePowerL3},
-        {Reg::P_TOTAL,   static_cast<uint16_t>(Reg::P_TOTAL   - startReg), &m.totalActivePower},
-        {Reg::PF,        static_cast<uint16_t>(Reg::PF        - startReg), &m.powerFactor},
-        {Reg::FREQUENCY, static_cast<uint16_t>(Reg::FREQUENCY - startReg), &m.frequency},
+    // 18 separate single-float reads. PF is read raw into m.powerFactor;
+    // the Schneider sign-decode is applied below the rotation loop so it
+    // doesn't run on the sentinel when PF fails permanently.
+    std::vector<SingleRead> reads = {
+        {Reg::I1,        &m.currentL1},
+        {Reg::I2,        &m.currentL2},
+        {Reg::I3,        &m.currentL3},
+        {Reg::I_AVG,     &m.currentAvg},
+        {Reg::U12,       &m.voltageL1L2},
+        {Reg::U23,       &m.voltageL2L3},
+        {Reg::U31,       &m.voltageL3L1},
+        {Reg::U_LL_AVG,  &m.voltageLLAvg},
+        {Reg::U1N,       &m.voltageL1N},
+        {Reg::U2N,       &m.voltageL2N},
+        {Reg::U3N,       &m.voltageL3N},
+        {Reg::U_LN_AVG,  &m.voltageLNAvg},
+        {Reg::P1,        &m.activePowerL1},
+        {Reg::P2,        &m.activePowerL2},
+        {Reg::P3,        &m.activePowerL3},
+        {Reg::P_TOTAL,   &m.totalActivePower},
+        {Reg::PF,        &m.powerFactor},
+        {Reg::FREQUENCY, &m.frequency},
     };
 
-    bool ok = false;
-    for (int attempt = 1; attempt <= MAX_ATTEMPTS; ++attempt)
+    // Queue of indices into reads. A failed read is put at the back of the
+    // queue for the next round; the natural backoff (time the rest of the
+    // queue takes to drain) is enough to outlast typical EMI bursts and
+    // slave busy-pockets.
+    std::vector<size_t> pending;
+    pending.reserve(reads.size());
+    for (size_t i = 0; i < reads.size(); ++i)
     {
-        if (tryBurstOnce(startReg, regCount, extracts))
+        pending.push_back(i);
+    }
+
+    for (int round = 1; round <= MAX_ROUNDS && !pending.empty(); ++round)
+    {
+        std::vector<size_t> stillFailing;
+        for (size_t idx : pending)
         {
-            ok = true;
-            break;
+            const auto& r = reads[idx];
+            std::vector<FloatExtract> extracts = { {r.regAddr, 0, r.outValue} };
+            if (!tryBurstOnce(r.regAddr, 2, extracts))
+            {
+                stillFailing.push_back(idx);
+            }
         }
-        if (attempt < MAX_ATTEMPTS)
+        pending = std::move(stillFailing);
+
+        if (round < MAX_ROUNDS && !pending.empty())
         {
-            std::this_thread::sleep_for(INTER_ATTEMPT_DELAY);
+            std::this_thread::sleep_for(INTER_ROUND_DELAY);
         }
     }
 
-    if (!ok)
+    const bool ok = pending.empty();
+    for (size_t idx : pending)
     {
-        std::cerr << "[IEM3250] burst read of " << regCount
-                  << " regs failed after " << MAX_ATTEMPTS
-                  << " attempts — writing sentinel " << INVALID_SENTINEL
-                  << " to all 18 values\n";
-        for (const auto& ext : extracts)
-        {
-            *ext.outValue = INVALID_SENTINEL;
-        }
+        const auto& r = reads[idx];
+        std::cerr << "[IEM3250] reg " << r.regAddr
+                  << " failed after " << MAX_ROUNDS
+                  << " rounds — writing sentinel " << INVALID_SENTINEL << '\n';
+        *r.outValue = INVALID_SENTINEL;
     }
 
     if (m.powerFactor != INVALID_SENTINEL)
