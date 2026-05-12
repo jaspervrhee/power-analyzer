@@ -7,25 +7,10 @@
 #include <thread>
 #include <utility>
 
+static constexpr int  MAX_ROUNDS         = 3;
+static constexpr auto INTER_ROUND_DELAY  = std::chrono::milliseconds(100);
+static constexpr float INVALID_SENTINEL  = -9999.0f;
 
-
-static constexpr int  MAX_ATTEMPTS         = 3;
-static constexpr auto RETRY_DELAY          = std::chrono::milliseconds(40);
-
-// Sentinel written to a column when its burst read fails after all retries.
-// Chosen to be visually distinct and outside the plausible physical range
-// for currents (>=0 A), voltages (>=0 V) and frequency (45-65 Hz). Active power
-// can legitimately be negative (grid feed-in), but -9999 kW lies far outside
-// the expected operating range for this installation, so the sentinel still
-// stands out clearly. The row's valid flag (set to 0 on any fallback) is
-// the authoritative invalid-marker; the sentinel just makes failed samples
-// immediately recognizable when inspecting the data in a spreadsheet.
-static constexpr float INVALID_SENTINEL = -9999.0f;
-
-// ---------------------------------------------------------------------------
-// IEM3250 Modbus register addresses (Schneider numbering)
-// Each float32 value occupies 2 consecutive 16-bit registers.
-// ---------------------------------------------------------------------------
 namespace Reg
 {
     static constexpr uint16_t I1 = 3000;
@@ -48,18 +33,23 @@ namespace Reg
     static constexpr uint16_t P3 = 3058;
     static constexpr uint16_t P_TOTAL = 3060;
 
-    // PF Total at register 3084. Schneider encodes signed PF on iEM3xxx
-    // in the range [-2, 2] to carry quadrant information (see decode below).
     static constexpr uint16_t PF = 3084;
     static constexpr uint16_t FREQUENCY = 3110;
-} // namespace Reg
+}
 
-// The IEM3250 requires a -2 offset on all Modbus register addresses.
 static constexpr int MODBUS_OFFSET = -2;
 
-// ---------------------------------------------------------------------------
-// Constructor / destructor
-// ---------------------------------------------------------------------------
+namespace {
+
+// One Modbus transaction reading exactly one float32 (= 2 registers).
+// On failure we put the index back at the end of the queue, giving it the
+// time of all other reads as natural backoff before the next attempt.
+struct SingleRead {
+    uint16_t regAddr;
+    float*   outValue;
+};
+
+}
 
 IEM3250LLD::IEM3250LLD(IIEM3250Communication &comm,
                        std::string port,
@@ -74,10 +64,6 @@ IEM3250LLD::~IEM3250LLD()
 {
     disconnect();
 }
-
-// ---------------------------------------------------------------------------
-// IMeterDriver
-// ---------------------------------------------------------------------------
 
 bool IEM3250LLD::connect()
 {
@@ -101,134 +87,111 @@ bool IEM3250LLD::readMeasurement(RawMeasurement &m)
         return false;
     }
 
-    // Stamp the moment the sample starts. The Modbus burst takes hundreds of
-    // ms; the consumer cares when the grid was sampled, not when the row was
-    // logged.
     m.measuredAt = std::chrono::system_clock::now();
 
-    // ok stays true only if every burst returned FRESH data. Any failure
-    // flips it to false so the row is logged with valid=0 and the failed
-    // columns carry the sentinel value.
-    bool ok = true;
+    // 18 separate single-float reads. PF is read raw into m.powerFactor;
+    // the Schneider sign-decode is applied below the rotation loop so it
+    // doesn't run on the sentinel when PF fails permanently.
+    std::vector<SingleRead> reads = {
+        {Reg::I1,        &m.currentL1},
+        {Reg::I2,        &m.currentL2},
+        {Reg::I3,        &m.currentL3},
+        {Reg::I_AVG,     &m.currentAvg},
+        {Reg::U12,       &m.voltageL1L2},
+        {Reg::U23,       &m.voltageL2L3},
+        {Reg::U31,       &m.voltageL3L1},
+        {Reg::U_LL_AVG,  &m.voltageLLAvg},
+        {Reg::U1N,       &m.voltageL1N},
+        {Reg::U2N,       &m.voltageL2N},
+        {Reg::U3N,       &m.voltageL3N},
+        {Reg::U_LN_AVG,  &m.voltageLNAvg},
+        {Reg::P1,        &m.activePowerL1},
+        {Reg::P2,        &m.activePowerL2},
+        {Reg::P3,        &m.activePowerL3},
+        {Reg::P_TOTAL,   &m.totalActivePower},
+        {Reg::PF,        &m.powerFactor},
+        {Reg::FREQUENCY, &m.frequency},
+    };
 
-    // Burst 1 — currents (registers 3000..3011, 6 float pairs of which 4 used).
-    ok &= readBurst(Reg::I1, 12, {
-        {Reg::I1,    0,  &m.currentL1},
-        {Reg::I2,    2,  &m.currentL2},
-        {Reg::I3,    4,  &m.currentL3},
-        {Reg::I_AVG, 10, &m.currentAvg},
-    });
-
-    // Burst 2 — line-line and line-neutral voltages (3020..3037).
-    ok &= readBurst(Reg::U12, 18, {
-        {Reg::U12,      0,  &m.voltageL1L2},
-        {Reg::U23,      2,  &m.voltageL2L3},
-        {Reg::U31,      4,  &m.voltageL3L1},
-        {Reg::U_LL_AVG, 6,  &m.voltageLLAvg},
-        {Reg::U1N,      8,  &m.voltageL1N},
-        {Reg::U2N,      10, &m.voltageL2N},
-        {Reg::U3N,      12, &m.voltageL3N},
-        {Reg::U_LN_AVG, 16, &m.voltageLNAvg},
-    });
-
-    // Burst 3 — active powers (3054..3061).
-    ok &= readBurst(Reg::P1, 8, {
-        {Reg::P1,      0, &m.activePowerL1},
-        {Reg::P2,      2, &m.activePowerL2},
-        {Reg::P3,      4, &m.activePowerL3},
-        {Reg::P_TOTAL, 6, &m.totalActivePower},
-    });
-
-    // Burst 4 — power factor (single float). We decode the Schneider sign
-    // convention here: raw range [-2, 2] carries the quadrant; |raw| > 1
-    // indicates leading (capacitive) operation. Normalised PF stays in [-1, 1].
-    // On burst failure the sentinel passes through the decode untouched
-    // (|sentinel| > 1) which would corrupt the displayed value, so we route
-    // around it explicitly.
-    float pfRaw = 0.0f;
-    const bool pfFresh = readBurst(Reg::PF, 2, {
-        {Reg::PF, 0, &pfRaw},
-    });
-    if (!pfFresh)
+    // Queue of indices into reads. A failed read is put at the back of the
+    // queue for the next round; the natural backoff (time the rest of the
+    // queue takes to drain) is enough to outlast typical EMI bursts and
+    // slave busy-pockets.
+    std::vector<size_t> pending;
+    pending.reserve(reads.size());
+    for (size_t i = 0; i < reads.size(); ++i)
     {
-        m.powerFactor = INVALID_SENTINEL;
+        pending.push_back(i);
     }
-    else if (pfRaw > 1.0f)
-    {
-        m.powerFactor = 2.0f - pfRaw;
-    }
-    else if (pfRaw < -1.0f)
-    {
-        m.powerFactor = -2.0f - pfRaw;
-    }
-    else
-    {
-        m.powerFactor = pfRaw;
-    }
-    ok &= pfFresh;
 
-    // Burst 5 — frequency.
-    ok &= readBurst(Reg::FREQUENCY, 2, {
-        {Reg::FREQUENCY, 0, &m.frequency},
-    });
+    for (int round = 1; round <= MAX_ROUNDS && !pending.empty(); ++round)
+    {
+        std::vector<size_t> stillFailing;
+        for (size_t idx : pending)
+        {
+            const auto& r = reads[idx];
+            std::vector<FloatExtract> extracts = { {r.regAddr, 0, r.outValue} };
+            if (!tryBurstOnce(r.regAddr, 2, extracts))
+            {
+                stillFailing.push_back(idx);
+            }
+        }
+        pending = std::move(stillFailing);
+
+        if (round < MAX_ROUNDS && !pending.empty())
+        {
+            std::this_thread::sleep_for(INTER_ROUND_DELAY);
+        }
+    }
+
+    const bool ok = pending.empty();
+    for (size_t idx : pending)
+    {
+        const auto& r = reads[idx];
+        std::cerr << "[IEM3250] reg " << r.regAddr
+                  << " failed after " << MAX_ROUNDS
+                  << " rounds — writing sentinel " << INVALID_SENTINEL << '\n';
+        *r.outValue = INVALID_SENTINEL;
+    }
+
+    if (m.powerFactor != INVALID_SENTINEL)
+    {
+        if (m.powerFactor > 1.0f)
+            m.powerFactor = 2.0f - m.powerFactor;
+        else if (m.powerFactor < -1.0f)
+            m.powerFactor = -2.0f - m.powerFactor;
+    }
 
     return ok;
 }
 
-// ---------------------------------------------------------------------------
-// Private helpers
-// ---------------------------------------------------------------------------
-
-bool IEM3250LLD::readBurst(uint16_t startRegAddr,
-                           uint16_t regCount,
-                           std::initializer_list<FloatExtract> extracts)
+bool IEM3250LLD::tryBurstOnce(uint16_t startReg,
+                              uint16_t regCount,
+                              const std::vector<FloatExtract>& extracts)
 {
-    // Apply the IEM3250 Modbus address offset on the burst's start address.
     const auto modbusAddr = static_cast<uint16_t>(
-        static_cast<int>(startRegAddr) + MODBUS_OFFSET);
+        static_cast<int>(startReg) + MODBUS_OFFSET);
 
-    for (int attempt = 1; attempt <= MAX_ATTEMPTS; ++attempt)
+    std::vector<uint16_t> regs;
+    if (!comm_.readHoldingRegisters(modbusAddr, regCount, regs))
     {
-        std::vector<uint16_t> regs;
-        const bool transportOk = comm_.readHoldingRegisters(modbusAddr, regCount, regs);
-
-        if (transportOk && regs.size() >= regCount)
-        {
-            // Fresh burst — decode every requested float.
-            for (const auto& ext : extracts)
-            {
-                *ext.outValue = decodeCDAB(regs[ext.offsetInBlock],
-                                           regs[ext.offsetInBlock + 1]);
-            }
-            return true;
-        }
-
-        if (attempt < MAX_ATTEMPTS)
-        {
-            std::this_thread::sleep_for(RETRY_DELAY);
-        }
+        return false;
+    }
+    if (regs.size() < regCount)
+    {
+        return false;
     }
 
-    // All attempts exhausted. Fill every requested float with the sentinel
-    // so downstream tooling can filter the bad sample by value, not just by
-    // the row's valid flag.
-    std::cerr << "[IEM3250] burst @reg " << startRegAddr
-              << " failed after " << MAX_ATTEMPTS
-              << " attempts — writing sentinel " << INVALID_SENTINEL
-              << " for " << extracts.size() << " column(s)\n";
     for (const auto& ext : extracts)
     {
-        *ext.outValue = INVALID_SENTINEL;
+        *ext.outValue = decodeCDAB(regs[ext.offsetInBlock],
+                                   regs[ext.offsetInBlock + 1]);
     }
-    return false;
+    return true;
 }
 
 float IEM3250LLD::decodeCDAB(uint16_t regLow, uint16_t regHigh)
 {
-    // CDAB byte order:
-    //   regLow  = low word  (bytes C, D — Modbus big-endian inside the word)
-    //   regHigh = high word (bytes A, B)
-    // Reconstruct: 32-bit = (AB << 16) | CD
     const uint32_t raw = (static_cast<uint32_t>(regHigh) << 16) |
                          static_cast<uint32_t>(regLow);
     float f;
