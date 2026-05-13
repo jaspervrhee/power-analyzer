@@ -11,7 +11,7 @@
 #include <gpiod.h>
 #endif
 
-static constexpr int  MAX_ROUNDS         = 3;
+static constexpr int  MAX_ROUNDS         = 6;
 static constexpr auto INTER_ROUND_DELAY  = std::chrono::milliseconds(100);
 static constexpr float INVALID_SENTINEL  = -9999.0f;
 
