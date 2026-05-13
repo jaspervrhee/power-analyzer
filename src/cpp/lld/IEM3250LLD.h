@@ -12,8 +12,8 @@ public:
     IEM3250LLD(IIEM3250Communication& comm,
                std::string port     = "/dev/serial0",
                int deviceId         = 1,
-               int baudRate         = 38400,
-               int timeoutMs        = 200);
+               int baudRate         = 19200,
+               int timeoutMs        = 500);
 
     ~IEM3250LLD() override;
 
