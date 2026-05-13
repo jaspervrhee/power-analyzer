@@ -26,7 +26,7 @@ add_library(power_analyzer_lib
 if(WIN32)
     target_link_libraries(power_analyzer_lib PRIVATE ws2_32)
 else()
-    target_link_libraries(power_analyzer_lib PRIVATE pthread)
+    target_link_libraries(power_analyzer_lib PRIVATE pthread gpiod)
 endif()
 
 add_executable(power_analyzer main.cpp)

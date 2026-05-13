@@ -8,9 +8,7 @@
 #include <utility>
 
 #if defined(__linux__)
-#include <fcntl.h>
-#include <unistd.h>
-#include <cstdio>
+#include <gpiod.h>
 #endif
 
 static constexpr int  MAX_ROUNDS         = 3;
@@ -55,81 +53,96 @@ struct SingleRead {
     float*   outValue;
 };
 
-// ---------- Raspberry Pi GPIO fail-trigger (sysfs) ----------
+// ---------- Raspberry Pi GPIO fail-trigger (libgpiod v2) ----------
 // Pulses a GPIO pin HIGH on every failed Modbus transaction so an
 // oscilloscope on that pin can trigger exactly on the moment of failure.
-// Diagnostic only — leave it in while debugging signal integrity, remove
-// the calls in tryBurstOnce when no longer needed. No-op on non-Linux
-// builds (Windows stub-mode keeps compiling).
-constexpr int GPIO_FAIL_PIN = 18;   // BCM numbering — change here if 18 is taken
-constexpr int FAIL_PULSE_MS = 5;
+// Diagnostic only — remove the calls in tryBurstOnce when no longer needed.
+// No-op on non-Linux builds (Windows stub-mode keeps compiling).
+//
+// Requires: apt install libgpiod-dev   (Debian Trixie ships libgpiod v2.2)
+// 40-pin header on Pi 3/4/5 typically maps to /dev/gpiochip0 — run
+// `gpiodetect` on the Pi if unsure.
+constexpr const char* GPIO_CHIP_PATH = "/dev/gpiochip0";
+constexpr unsigned    GPIO_FAIL_PIN  = 18;   // BCM offset — header pin 12
+constexpr int         FAIL_PULSE_MS  = 5;
 
 #if defined(__linux__)
-int  gpioValueFd = -1;
-bool gpioReady   = false;
+gpiod_chip*         gpioChip    = nullptr;
+gpiod_line_request* gpioRequest = nullptr;
 
 void gpioInit()
 {
-    if (gpioReady) return;
+    if (gpioRequest) return;
 
-    char pinStr[8];
-    const int pinLen = std::snprintf(pinStr, sizeof(pinStr), "%d", GPIO_FAIL_PIN);
-
-    int fd = ::open("/sys/class/gpio/export", O_WRONLY);
-    if (fd < 0) {
-        std::cerr << "[IEM3250] gpio export open failed — fail-trigger disabled\n";
+    gpioChip = gpiod_chip_open(GPIO_CHIP_PATH);
+    if (!gpioChip) {
+        std::cerr << "[IEM3250] gpiod_chip_open(\"" << GPIO_CHIP_PATH
+                  << "\") failed — fail-trigger disabled\n";
         return;
     }
-    ::write(fd, pinStr, static_cast<size_t>(pinLen));  // EBUSY = already exported, fine
-    ::close(fd);
 
-    // udev needs a moment to chown the new gpio<N> dir.
-    std::this_thread::sleep_for(std::chrono::milliseconds(150));
-
-    char dirPath[64];
-    std::snprintf(dirPath, sizeof(dirPath), "/sys/class/gpio/gpio%d/direction", GPIO_FAIL_PIN);
-    fd = ::open(dirPath, O_WRONLY);
-    if (fd < 0) {
-        std::cerr << "[IEM3250] gpio direction open failed — fail-trigger disabled\n";
+    gpiod_line_settings* settings = gpiod_line_settings_new();
+    gpiod_line_config*   lineCfg  = gpiod_line_config_new();
+    gpiod_request_config* reqCfg  = gpiod_request_config_new();
+    if (!settings || !lineCfg || !reqCfg) {
+        std::cerr << "[IEM3250] gpiod alloc failed — fail-trigger disabled\n";
+        if (reqCfg)   gpiod_request_config_free(reqCfg);
+        if (lineCfg)  gpiod_line_config_free(lineCfg);
+        if (settings) gpiod_line_settings_free(settings);
+        gpiod_chip_close(gpioChip);
+        gpioChip = nullptr;
         return;
     }
-    ::write(fd, "out", 3);
-    ::close(fd);
 
-    char valuePath[64];
-    std::snprintf(valuePath, sizeof(valuePath), "/sys/class/gpio/gpio%d/value", GPIO_FAIL_PIN);
-    gpioValueFd = ::open(valuePath, O_WRONLY);
-    if (gpioValueFd < 0) {
-        std::cerr << "[IEM3250] gpio value open failed — fail-trigger disabled\n";
+    gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_OUTPUT);
+    gpiod_line_settings_set_output_value(settings, GPIOD_LINE_VALUE_INACTIVE);
+
+    const unsigned offset = GPIO_FAIL_PIN;
+    if (gpiod_line_config_add_line_settings(lineCfg, &offset, 1, settings) < 0) {
+        std::cerr << "[IEM3250] gpiod_line_config_add_line_settings failed — fail-trigger disabled\n";
+        gpiod_request_config_free(reqCfg);
+        gpiod_line_config_free(lineCfg);
+        gpiod_line_settings_free(settings);
+        gpiod_chip_close(gpioChip);
+        gpioChip = nullptr;
         return;
     }
-    ::write(gpioValueFd, "0", 1);
-    gpioReady = true;
+
+    gpiod_request_config_set_consumer(reqCfg, "power-analyzer");
+
+    gpioRequest = gpiod_chip_request_lines(gpioChip, reqCfg, lineCfg);
+
+    gpiod_request_config_free(reqCfg);
+    gpiod_line_config_free(lineCfg);
+    gpiod_line_settings_free(settings);
+
+    if (!gpioRequest) {
+        std::cerr << "[IEM3250] gpiod_chip_request_lines failed (line busy?) — fail-trigger disabled\n";
+        gpiod_chip_close(gpioChip);
+        gpioChip = nullptr;
+        return;
+    }
 }
 
 void gpioPulseFailure()
 {
-    if (!gpioReady) return;
-    ::write(gpioValueFd, "1", 1);
+    if (!gpioRequest) return;
+    gpiod_line_request_set_value(gpioRequest, GPIO_FAIL_PIN, GPIOD_LINE_VALUE_ACTIVE);
     std::this_thread::sleep_for(std::chrono::milliseconds(FAIL_PULSE_MS));
-    ::write(gpioValueFd, "0", 1);
+    gpiod_line_request_set_value(gpioRequest, GPIO_FAIL_PIN, GPIOD_LINE_VALUE_INACTIVE);
 }
 
 void gpioCleanup()
 {
-    if (gpioValueFd >= 0) {
-        ::write(gpioValueFd, "0", 1);
-        ::close(gpioValueFd);
-        gpioValueFd = -1;
+    if (gpioRequest) {
+        gpiod_line_request_set_value(gpioRequest, GPIO_FAIL_PIN, GPIOD_LINE_VALUE_INACTIVE);
+        gpiod_line_request_release(gpioRequest);
+        gpioRequest = nullptr;
     }
-    int fd = ::open("/sys/class/gpio/unexport", O_WRONLY);
-    if (fd >= 0) {
-        char pinStr[8];
-        const int pinLen = std::snprintf(pinStr, sizeof(pinStr), "%d", GPIO_FAIL_PIN);
-        ::write(fd, pinStr, static_cast<size_t>(pinLen));
-        ::close(fd);
+    if (gpioChip) {
+        gpiod_chip_close(gpioChip);
+        gpioChip = nullptr;
     }
-    gpioReady = false;
 }
 #else
 void gpioInit()         {}
