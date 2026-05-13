@@ -7,6 +7,12 @@
 #include <thread>
 #include <utility>
 
+#if defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
+#include <cstdio>
+#endif
+
 static constexpr int  MAX_ROUNDS         = 3;
 static constexpr auto INTER_ROUND_DELAY  = std::chrono::milliseconds(100);
 static constexpr float INVALID_SENTINEL  = -9999.0f;
@@ -49,6 +55,88 @@ struct SingleRead {
     float*   outValue;
 };
 
+// ---------- Raspberry Pi GPIO fail-trigger (sysfs) ----------
+// Pulses a GPIO pin HIGH on every failed Modbus transaction so an
+// oscilloscope on that pin can trigger exactly on the moment of failure.
+// Diagnostic only — leave it in while debugging signal integrity, remove
+// the calls in tryBurstOnce when no longer needed. No-op on non-Linux
+// builds (Windows stub-mode keeps compiling).
+constexpr int GPIO_FAIL_PIN = 18;   // BCM numbering — change here if 18 is taken
+constexpr int FAIL_PULSE_MS = 5;
+
+#if defined(__linux__)
+int  gpioValueFd = -1;
+bool gpioReady   = false;
+
+void gpioInit()
+{
+    if (gpioReady) return;
+
+    char pinStr[8];
+    const int pinLen = std::snprintf(pinStr, sizeof(pinStr), "%d", GPIO_FAIL_PIN);
+
+    int fd = ::open("/sys/class/gpio/export", O_WRONLY);
+    if (fd < 0) {
+        std::cerr << "[IEM3250] gpio export open failed — fail-trigger disabled\n";
+        return;
+    }
+    ::write(fd, pinStr, static_cast<size_t>(pinLen));  // EBUSY = already exported, fine
+    ::close(fd);
+
+    // udev needs a moment to chown the new gpio<N> dir.
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    char dirPath[64];
+    std::snprintf(dirPath, sizeof(dirPath), "/sys/class/gpio/gpio%d/direction", GPIO_FAIL_PIN);
+    fd = ::open(dirPath, O_WRONLY);
+    if (fd < 0) {
+        std::cerr << "[IEM3250] gpio direction open failed — fail-trigger disabled\n";
+        return;
+    }
+    ::write(fd, "out", 3);
+    ::close(fd);
+
+    char valuePath[64];
+    std::snprintf(valuePath, sizeof(valuePath), "/sys/class/gpio/gpio%d/value", GPIO_FAIL_PIN);
+    gpioValueFd = ::open(valuePath, O_WRONLY);
+    if (gpioValueFd < 0) {
+        std::cerr << "[IEM3250] gpio value open failed — fail-trigger disabled\n";
+        return;
+    }
+    ::write(gpioValueFd, "0", 1);
+    gpioReady = true;
+}
+
+void gpioPulseFailure()
+{
+    if (!gpioReady) return;
+    ::write(gpioValueFd, "1", 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(FAIL_PULSE_MS));
+    ::write(gpioValueFd, "0", 1);
+}
+
+void gpioCleanup()
+{
+    if (gpioValueFd >= 0) {
+        ::write(gpioValueFd, "0", 1);
+        ::close(gpioValueFd);
+        gpioValueFd = -1;
+    }
+    int fd = ::open("/sys/class/gpio/unexport", O_WRONLY);
+    if (fd >= 0) {
+        char pinStr[8];
+        const int pinLen = std::snprintf(pinStr, sizeof(pinStr), "%d", GPIO_FAIL_PIN);
+        ::write(fd, pinStr, static_cast<size_t>(pinLen));
+        ::close(fd);
+    }
+    gpioReady = false;
+}
+#else
+void gpioInit()         {}
+void gpioPulseFailure() {}
+void gpioCleanup()      {}
+#endif
+
 }
 
 IEM3250LLD::IEM3250LLD(IIEM3250Communication &comm,
@@ -58,11 +146,13 @@ IEM3250LLD::IEM3250LLD(IIEM3250Communication &comm,
                        int timeoutMs)
     : comm_(comm), port_(std::move(port)), deviceId_(deviceId), baudRate_(baudRate), timeoutMs_(timeoutMs)
 {
+    gpioInit();
 }
 
 IEM3250LLD::~IEM3250LLD()
 {
     disconnect();
+    gpioCleanup();
 }
 
 bool IEM3250LLD::connect()
@@ -175,10 +265,12 @@ bool IEM3250LLD::tryBurstOnce(uint16_t startReg,
     std::vector<uint16_t> regs;
     if (!comm_.readHoldingRegisters(modbusAddr, regCount, regs))
     {
+        gpioPulseFailure();
         return false;
     }
     if (regs.size() < regCount)
     {
+        gpioPulseFailure();
         return false;
     }
 
