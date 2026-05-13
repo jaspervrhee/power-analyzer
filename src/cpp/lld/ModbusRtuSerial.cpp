@@ -13,6 +13,49 @@
 #include <chrono>
 
 // ---------------------------------------------------------------------------
+// Failure-reason counters (file-local). Lets us tell apart
+// master->slave damage from slave->master damage without needing
+// Modbus diagnostics on the meter (the iEM3250 doesn't expose them).
+// ---------------------------------------------------------------------------
+namespace {
+
+struct Counters {
+    uint64_t total        = 0;
+    uint64_t ok           = 0;
+    uint64_t sendFail     = 0;   // write() to serial returned short
+    uint64_t timeout0     = 0;   // timeout, 0 bytes received  -> meter didn't reply at all
+    uint64_t timeoutP     = 0;   // timeout, partial response  -> reply got cut off
+    uint64_t readError    = 0;   // read() returned <= 0
+    uint64_t badHeader    = 0;   // slave id or FC mismatch    -> garbled start of reply
+    uint64_t badByteCount = 0;   // byte-count field wrong     -> byte dropped in reply
+    uint64_t crcFail      = 0;   // CRC mismatch               -> bit flip somewhere in reply
+};
+
+Counters counters;
+
+constexpr uint64_t LOG_EVERY = 100;
+
+void logModbusStats(const char* tag)
+{
+    const auto& c = counters;
+    const uint64_t fail = c.sendFail + c.timeout0 + c.timeoutP + c.readError
+                        + c.badHeader + c.badByteCount + c.crcFail;
+    std::cerr << "[Modbus " << tag << "] total=" << c.total
+              << " ok=" << c.ok
+              << " fail=" << fail
+              << " | sendFail=" << c.sendFail
+              << " timeout0=" << c.timeout0
+              << " timeoutP=" << c.timeoutP
+              << " rdErr=" << c.readError
+              << " badHdr=" << c.badHeader
+              << " badBC=" << c.badByteCount
+              << " crc=" << c.crcFail
+              << '\n';
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
 // Construction / destruction
 // ---------------------------------------------------------------------------
 
@@ -24,6 +67,7 @@ ModbusRtuSerial::ModbusRtuSerial()
 ModbusRtuSerial::~ModbusRtuSerial()
 {
     disconnect();
+    logModbusStats("final");
 }
 
 // ---------------------------------------------------------------------------
@@ -138,13 +182,22 @@ bool ModbusRtuSerial::readHoldingRegisters(uint16_t address,
     }
 
     ::tcflush(fd_, TCIOFLUSH);
+    ++counters.total;
 
     if (!sendReadRequest(address, count))
     {
+        ++counters.sendFail;
         return false;
     }
 
-    return receiveReadResponse(count, data);
+    const bool ok = receiveReadResponse(count, data);
+
+    if (counters.total % LOG_EVERY == 0)
+    {
+        logModbusStats("periodic");
+    }
+
+    return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +256,7 @@ bool ModbusRtuSerial::receiveReadResponse(uint16_t expectedCount,
 
         if (remaining <= 0)
         {
+            if (received == 0) ++counters.timeout0; else ++counters.timeoutP;
             return false;
         }
 
@@ -213,12 +267,14 @@ bool ModbusRtuSerial::receiveReadResponse(uint16_t expectedCount,
         int ret = ::select(fd_ + 1, &rfds, nullptr, nullptr, &tv);
         if (ret <= 0)
         {
+            if (received == 0) ++counters.timeout0; else ++counters.timeoutP;
             return false; // timeout or error
         }
 
         ssize_t n = ::read(fd_, buf.data() + received, expectedLen - received);
         if (n <= 0)
         {
+            ++counters.readError;
             return false;
         }
 
@@ -228,12 +284,14 @@ bool ModbusRtuSerial::receiveReadResponse(uint16_t expectedCount,
     // Validate device ID and function code
     if (buf[0] != static_cast<uint8_t>(deviceId_) || buf[1] != 0x03)
     {
+        ++counters.badHeader;
         return false;
     }
 
     // Validate byte count
     if (buf[2] != static_cast<uint8_t>(expectedCount * 2))
     {
+        ++counters.badByteCount;
         return false;
     }
 
@@ -244,6 +302,7 @@ bool ModbusRtuSerial::receiveReadResponse(uint16_t expectedCount,
 
     if (computedCrc != receivedCrc)
     {
+        ++counters.crcFail;
         return false;
     }
 
@@ -256,6 +315,7 @@ bool ModbusRtuSerial::receiveReadResponse(uint16_t expectedCount,
                   static_cast<uint16_t>(buf[offset + 1]);
     }
 
+    ++counters.ok;
     return true;
 }
 
