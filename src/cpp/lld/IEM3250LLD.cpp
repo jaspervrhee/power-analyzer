@@ -11,8 +11,11 @@
 #include <gpiod.h>
 #endif
 
-static constexpr int  MAX_ROUNDS         = 6;
-static constexpr auto INTER_ROUND_DELAY  = std::chrono::milliseconds(50);
+// Deadline-based retry strategy: keep retrying failed reads until the
+// measurement budget is exhausted, then write sentinels for the rest.
+// Guarantees 1 Hz cycle (caller calls us once/sec) regardless of fail rate.
+static constexpr auto MEASUREMENT_BUDGET = std::chrono::milliseconds(900);
+static constexpr auto INTER_ROUND_DELAY  = std::chrono::milliseconds(20);
 static constexpr float INVALID_SENTINEL  = -9999.0f;
 
 namespace Reg
@@ -216,10 +219,11 @@ bool IEM3250LLD::readMeasurement(RawMeasurement &m)
         {Reg::FREQUENCY, &m.frequency},
     };
 
-    // Queue of indices into reads. A failed read is put at the back of the
-    // queue for the next round; the natural backoff (time the rest of the
-    // queue takes to drain) is enough to outlast typical EMI bursts and
-    // slave busy-pockets.
+    // Deadline-based retry: keep retrying failed reads as long as there's
+    // budget left. Cycle is hard-capped at MEASUREMENT_BUDGET so the caller
+    // can keep its 1 Hz cadence regardless of how bad the bus is.
+    const auto deadline = std::chrono::steady_clock::now() + MEASUREMENT_BUDGET;
+
     std::vector<size_t> pending;
     pending.reserve(reads.size());
     for (size_t i = 0; i < reads.size(); ++i)
@@ -227,11 +231,19 @@ bool IEM3250LLD::readMeasurement(RawMeasurement &m)
         pending.push_back(i);
     }
 
-    for (int round = 1; round <= MAX_ROUNDS && !pending.empty(); ++round)
+    int round = 0;
+    while (!pending.empty())
     {
+        ++round;
         std::vector<size_t> stillFailing;
         for (size_t idx : pending)
         {
+            if (std::chrono::steady_clock::now() >= deadline)
+            {
+                // Out of time — push the rest unchecked; they'll be sentinelled below.
+                stillFailing.push_back(idx);
+                continue;
+            }
             const auto& r = reads[idx];
             std::vector<FloatExtract> extracts = { {r.regAddr, 0, r.outValue} };
             if (!tryBurstOnce(r.regAddr, 2, extracts))
@@ -241,19 +253,22 @@ bool IEM3250LLD::readMeasurement(RawMeasurement &m)
         }
         pending = std::move(stillFailing);
 
-        if (round < MAX_ROUNDS && !pending.empty())
-        {
-            std::this_thread::sleep_for(INTER_ROUND_DELAY);
-        }
+        if (pending.empty()) break;
+        if (std::chrono::steady_clock::now() >= deadline) break;
+
+        std::this_thread::sleep_for(INTER_ROUND_DELAY);
     }
 
     const bool ok = pending.empty();
+    if (!pending.empty())
+    {
+        std::cerr << "[IEM3250] " << pending.size() << " of " << reads.size()
+                  << " reads unfinished after " << round << " rounds (deadline) — "
+                  << "writing sentinel " << INVALID_SENTINEL << " to those\n";
+    }
     for (size_t idx : pending)
     {
         const auto& r = reads[idx];
-        std::cerr << "[IEM3250] reg " << r.regAddr
-                  << " failed after " << MAX_ROUNDS
-                  << " rounds — writing sentinel " << INVALID_SENTINEL << '\n';
         *r.outValue = INVALID_SENTINEL;
     }
 
