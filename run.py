@@ -85,7 +85,7 @@ def main():
         "-pthread",
         "-g",
         "-o", "power_analyzer",
-    ] + cpp_files
+    ] + cpp_files + ["-lgpiod"]
     
     # Build
     if not run_command(build_cmd, "Building C++ project"):
