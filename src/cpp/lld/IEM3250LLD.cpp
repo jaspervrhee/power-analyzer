@@ -4,6 +4,7 @@
 #include <cstring>
 #include <iostream>
 #include <iomanip>
+#include <random>
 #include <thread>
 #include <utility>
 
@@ -15,8 +16,32 @@
 // measurement budget is exhausted, then write sentinels for the rest.
 // Guarantees 1 Hz cycle (caller calls us once/sec) regardless of fail rate.
 static constexpr auto MEASUREMENT_BUDGET = std::chrono::milliseconds(900);
-static constexpr auto INTER_ROUND_DELAY  = std::chrono::milliseconds(20);
 static constexpr float INVALID_SENTINEL  = -9999.0f;
+
+// After this many consecutive failures on the same register, slip a read of a
+// *different* register in front of the next retry. Goal: break any timing-lock
+// with periodic bus noise by changing the request bytes and the spacing.
+static constexpr int SACRIFICIAL_THRESHOLD = 3;
+
+// Per-attempt jittered backoff. Random component breaks lock-step with any
+// periodic noise source (mains harmonics, VFD switching) that would otherwise
+// hit the exact same fault window on every retry. Growing base gives the bus
+// time to settle after a noise burst.
+static std::chrono::milliseconds retryBackoff(int failCount, std::mt19937& rng)
+{
+    int base = 0;
+    int jitter = 0;
+    switch (failCount)
+    {
+    case 0:  return std::chrono::milliseconds(0);
+    case 1:  base = 20;  jitter = 10; break;
+    case 2:  base = 40;  jitter = 20; break;
+    case 3:  base = 80;  jitter = 40; break;
+    default: base = 150; jitter = 50; break;
+    }
+    std::uniform_int_distribution<int> dist(0, jitter);
+    return std::chrono::milliseconds(base + dist(rng));
+}
 
 namespace Reg
 {
@@ -225,6 +250,12 @@ bool IEM3250LLD::readMeasurement(RawMeasurement &m)
         pending.push_back(i);
     }
 
+    std::vector<int> failCount(reads.size(), 0);
+
+    // Single shared RNG across calls — cheap to construct, harmless if
+    // readMeasurement is ever called concurrently (we don't need crypto-grade).
+    static std::mt19937 rng{std::random_device{}()};
+
     int round = 0;
     while (!pending.empty())
     {
@@ -238,10 +269,35 @@ bool IEM3250LLD::readMeasurement(RawMeasurement &m)
                 stillFailing.push_back(idx);
                 continue;
             }
+
+            // Jittered, growing backoff before retrying a register that has
+            // already failed in this measurement cycle.
+            if (failCount[idx] > 0)
+            {
+                const auto backoff = retryBackoff(failCount[idx], rng);
+                if (std::chrono::steady_clock::now() + backoff < deadline)
+                {
+                    std::this_thread::sleep_for(backoff);
+                }
+            }
+
+            // After repeated failures, slip in a read of a different register
+            // before the real retry. Different request bytes, different timing,
+            // forces the meter into a new transaction context — breaks the lock.
+            if (failCount[idx] >= SACRIFICIAL_THRESHOLD)
+            {
+                const size_t sacIdx = (idx + 1) % reads.size();
+                const auto sacAddr = static_cast<uint16_t>(
+                    static_cast<int>(reads[sacIdx].regAddr) + MODBUS_OFFSET);
+                std::vector<uint16_t> sacRegs;
+                comm_.readHoldingRegisters(sacAddr, 2, sacRegs); // result discarded
+            }
+
             const auto& r = reads[idx];
             std::vector<FloatExtract> extracts = { {r.regAddr, 0, r.outValue} };
             if (!tryBurstOnce(r.regAddr, 2, extracts))
             {
+                ++failCount[idx];
                 stillFailing.push_back(idx);
             }
         }
@@ -249,8 +305,7 @@ bool IEM3250LLD::readMeasurement(RawMeasurement &m)
 
         if (pending.empty()) break;
         if (std::chrono::steady_clock::now() >= deadline) break;
-
-        std::this_thread::sleep_for(INTER_ROUND_DELAY);
+        // No inter-round delay — per-read jittered backoff above handles spacing.
     }
 
     const bool ok = pending.empty();
