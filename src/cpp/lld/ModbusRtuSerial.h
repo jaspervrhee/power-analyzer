@@ -1,5 +1,7 @@
 #pragma once
 
+#include <chrono>
+
 #include "interfaces/IIEM3250Communication.h"
 
 /**
@@ -8,8 +10,8 @@
  * Concrete implementation of IIEM3250Communication using Modbus RTU
  * framing over a POSIX serial port (Linux / Raspberry Pi 4B).
  *
- * Serial settings match the IEM3250 factory defaults:
- *   19200 baud, 8 data bits, even parity, 1 stop bit (8E1).
+ * Framing: 8 data bits, even parity, 1 stop bit (8E1). Baud rate is
+ * caller-supplied (the IEM3250 supports 9600/19200/38400).
  */
 class ModbusRtuSerial : public IIEM3250Communication {
 public:
@@ -33,6 +35,10 @@ private:
     int    fd_;        ///< File descriptor for the serial port (-1 = closed)
     int    deviceId_;
     int    timeoutMs_;
+
+    /// Timestamp of the last byte sent or received. Used to enforce the
+    /// Modbus RTU t3.5 inter-frame silence before starting a new request.
+    std::chrono::steady_clock::time_point lastBusActivity_{};
 
     /** Build and send a Modbus RTU Read Holding Registers request. */
     bool sendReadRequest(uint16_t address, uint16_t count);

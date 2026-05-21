@@ -195,9 +195,6 @@ bool IEM3250LLD::readMeasurement(RawMeasurement &m)
 
     m.measuredAt = std::chrono::system_clock::now();
 
-    // 18 separate single-float reads. PF is read raw into m.powerFactor;
-    // the Schneider sign-decode is applied below the rotation loop so it
-    // doesn't run on the sentinel when PF fails permanently.
     std::vector<SingleRead> reads = {
         {Reg::I1,        &m.currentL1},
         {Reg::I2,        &m.currentL2},
@@ -219,9 +216,6 @@ bool IEM3250LLD::readMeasurement(RawMeasurement &m)
         {Reg::FREQUENCY, &m.frequency},
     };
 
-    // Deadline-based retry: keep retrying failed reads as long as there's
-    // budget left. Cycle is hard-capped at MEASUREMENT_BUDGET so the caller
-    // can keep its 1 Hz cadence regardless of how bad the bus is.
     const auto deadline = std::chrono::steady_clock::now() + MEASUREMENT_BUDGET;
 
     std::vector<size_t> pending;

@@ -10,7 +10,14 @@
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 #include <chrono>
+
+// Modbus RTU requires ≥3.5 character times of silence between frames.
+// At 38400 8E1 (11 bits/char) that's ~1.0 ms; at 19200 ~2.0 ms; at 9600 ~4.0 ms.
+// We use a fixed 5 ms guard which is comfortable above t3.5 for all supported
+// baud rates and still fits the 1 Hz measurement budget (18 reads × 5 ms = 90 ms).
+static constexpr auto MODBUS_T35_GUARD = std::chrono::milliseconds(5);
 
 // ---------------------------------------------------------------------------
 // Failure-reason counters (file-local). Lets us tell apart
@@ -181,16 +188,28 @@ bool ModbusRtuSerial::readHoldingRegisters(uint16_t address,
         return false;
     }
 
+    // Enforce Modbus RTU t3.5 inter-frame silence. Without this the meter
+    // can merge our request into the tail of its previous reply, which shows
+    // up as timeout0 (no answer) and CRC errors (collision on the bus).
+    const auto nextAllowed = lastBusActivity_ + MODBUS_T35_GUARD;
+    const auto now = std::chrono::steady_clock::now();
+    if (now < nextAllowed)
+    {
+        std::this_thread::sleep_for(nextAllowed - now);
+    }
+
     ::tcflush(fd_, TCIOFLUSH);
     ++counters.total;
 
     if (!sendReadRequest(address, count))
     {
         ++counters.sendFail;
+        lastBusActivity_ = std::chrono::steady_clock::now();
         return false;
     }
 
     const bool ok = receiveReadResponse(count, data);
+    lastBusActivity_ = std::chrono::steady_clock::now();
 
     if (counters.total % LOG_EVERY == 0)
     {
@@ -238,8 +257,10 @@ bool ModbusRtuSerial::receiveReadResponse(uint16_t expectedCount,
     const size_t expectedLen = 3u + static_cast<size_t>(expectedCount) * 2u + 2u;
     std::vector<uint8_t> buf(expectedLen, 0);
 
-    // Flush input buffer to avoid stale data from previous reads
-    ::tcflush(fd_, TCIFLUSH);
+    // Note: do not flush the input buffer here. The TCIOFLUSH at the start of
+    // readHoldingRegisters already cleared stale data, and by the time tcdrain
+    // returns the slave may already have started replying — flushing now would
+    // discard the first byte(s) of the response and surface as badHeader/CRC.
 
     auto startTime = std::chrono::steady_clock::now();
     size_t received = 0;
