@@ -13,7 +13,7 @@ public:
                std::string port     = "/dev/serial0",
                int deviceId         = 1,
                int baudRate         = 38400,
-               int timeoutMs        = 100);
+               int timeoutMs        = 30);
 
     ~IEM3250LLD() override;
 
