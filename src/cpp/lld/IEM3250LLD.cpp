@@ -81,6 +81,39 @@ struct SingleRead {
     float*   outValue;
 };
 
+// ---------------------------------------------------------------------------
+// Cycle-level quality counters. The real KPI is not per-transaction CRC rate
+// but: did we get all 18 reads in the 1 Hz budget? Each cycle either lands
+// all 18 (complete) or writes one or more sentinels (incomplete).
+// ---------------------------------------------------------------------------
+struct CycleCounters {
+    uint64_t totalCycles      = 0;
+    uint64_t completeCycles   = 0;
+    uint64_t incompleteCycles = 0;
+    uint64_t totalSentinels   = 0;
+    uint64_t worstSentinels   = 0;  // largest single-cycle sentinel count seen
+};
+
+CycleCounters cycleCounters;
+
+constexpr uint64_t CYCLE_LOG_EVERY = 60;  // ~once per minute at 1 Hz
+
+void logCycleStats()
+{
+    const auto& c = cycleCounters;
+    const double completePct = c.totalCycles
+        ? (100.0 * static_cast<double>(c.completeCycles)
+                 / static_cast<double>(c.totalCycles))
+        : 0.0;
+    std::cerr << "[IEM3250 cycles] total=" << c.totalCycles
+              << " complete=" << c.completeCycles
+              << " incomplete=" << c.incompleteCycles
+              << " sentinels=" << c.totalSentinels
+              << " worst=" << c.worstSentinels
+              << " | complete=" << std::fixed << std::setprecision(2)
+              << completePct << "%\n";
+}
+
 // ---------- Raspberry Pi GPIO fail-trigger (libgpiod v2) ----------
 // Pulses a GPIO pin HIGH on every failed Modbus transaction so an
 // oscilloscope on that pin can trigger exactly on the moment of failure.
@@ -319,6 +352,23 @@ bool IEM3250LLD::readMeasurement(RawMeasurement &m)
     {
         const auto& r = reads[idx];
         *r.outValue = INVALID_SENTINEL;
+    }
+
+    ++cycleCounters.totalCycles;
+    if (ok)
+    {
+        ++cycleCounters.completeCycles;
+    }
+    else
+    {
+        ++cycleCounters.incompleteCycles;
+        const uint64_t n = pending.size();
+        cycleCounters.totalSentinels += n;
+        if (n > cycleCounters.worstSentinels) cycleCounters.worstSentinels = n;
+    }
+    if (cycleCounters.totalCycles % CYCLE_LOG_EVERY == 0)
+    {
+        logCycleStats();
     }
 
     if (m.powerFactor != INVALID_SENTINEL)
