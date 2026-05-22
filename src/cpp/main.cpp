@@ -1,24 +1,10 @@
 #include "lld/IEM3250LLD.h"
 #include "lld/FLOG_LLD.h"
 #include "lld/BufferedLogBackend.h"
+#include "lld/ModbusRtuSerial.h"
 #include "hld/MeterHLD.h"
 #include "hld/LogHLD.h"
 #include "controller/Controller.h"
-
-// #define USE_REAL_SERIAL  // Uncomment for real serial (Linux), comment for stub
-
-#ifdef USE_REAL_SERIAL
-#include "lld/ModbusRtuSerial.h"
-using SerialImpl = ModbusRtuSerial;
-#else
-#ifdef _WIN32
-#include "lld/ModbusRtuSerialStub.h"
-using SerialImpl = ModbusRtuSerialStub;
-#else
-#include "lld/ModbusRtuSerial.h"
-using SerialImpl = ModbusRtuSerial;
-#endif
-#endif
 
 #include <iostream>
 #include <chrono>
@@ -35,72 +21,69 @@ static void handleSigint(int /*sig*/)
 
 static void printMeasurement(const MeterMeasurement &m)
 {
+    // Invalid measurements get a one-line marker instead of the full dump
     if (!m.valid)
     {
-        std::cout << "[Controller] Meting ongeldig\n";
+        std::cout << "[Controller] Measurement invalid\n";
         return;
     }
 
-    std::cout << "\n=== IEM3250 Meting ===\n";
-    std::cout << "Stroom  L1/L2/L3:     " << m.currentL1 << " / " << m.currentL2 << " / " << m.currentL3 << " A\n";
-    std::cout << "Spanning L1-N/L2-N/L3-N: " << m.voltageL1N << " / " << m.voltageL2N << " / " << m.voltageL3N << " V\n";
-    std::cout << "Spanning L1-L2/L2-L3/L3-L1: " << m.voltageL1L2 << " / " << m.voltageL2L3 << " / " << m.voltageL3L1 << " V\n";
-    std::cout << "Vermogen P1/P2/P3:    " << m.activePowerL1 << " / " << m.activePowerL2 << " / " << m.activePowerL3 << " kW\n";
-    std::cout << "Totaal vermogen:      " << m.totalActivePower << " kW\n";
-    std::cout << "Vermogensfactor:      " << m.powerFactor << "\n";
-    std::cout << "Frequentie:           " << m.frequency << " Hz\n";
+    // Full multi-line dump of all measured quantities
+    std::cout << "\n=== IEM3250 Measurement ===\n";
+    std::cout << "Current  L1/L2/L3:     " << m.currentL1 << " / " << m.currentL2 << " / " << m.currentL3 << " A\n";
+    std::cout << "Voltage L1-N/L2-N/L3-N: " << m.voltageL1N << " / " << m.voltageL2N << " / " << m.voltageL3N << " V\n";
+    std::cout << "Voltage L1-L2/L2-L3/L3-L1: " << m.voltageL1L2 << " / " << m.voltageL2L3 << " / " << m.voltageL3L1 << " V\n";
+    std::cout << "Power P1/P2/P3:        " << m.activePowerL1 << " / " << m.activePowerL2 << " / " << m.activePowerL3 << " kW\n";
+    std::cout << "Total power:           " << m.totalActivePower << " kW\n";
+    std::cout << "Power factor:          " << m.powerFactor << "\n";
+    std::cout << "Frequency:             " << m.frequency << " Hz\n";
 }
 
 int main(int argc, char *argv[])
 {
-    // --- Meter stack opbouwen -------------------------------------------------
-    SerialImpl serial;
+    // Meter stack: serial transport -> driver -> high-level service
+    ModbusRtuSerial serial;
     IEM3250LLD meterLld(serial, "/dev/serial0", /*deviceId=*/1);
     MeterHLD meterHld(meterLld);
 
-    // --- Log stack opbouwen ---------------------------------------------------
-    // FLOG zit achter een buffer: valt de logServer weg, dan blijven we meten
-    // en loggen we alles na zodra de verbinding terug is.
-    // Meer backends? Maak een nieuw ILogBackend en voeg 'm toe met addBackend().
+    // FLOG stack: TCP backend wrapped in a buffer, exposed via LogHLD
     FLOG_LLD           flogLld{"134.188.254.132", 17540};
     BufferedLogBackend bufferedFlog{flogLld, 100000};  // ~28h buffer at 1Hz, ~150MB RAM
     LogHLD             logHld;
     logHld.addBackend(bufferedFlog);
 
-    // --- Controller met beide services ---------------------------------------
-    // Polling interval: 1 second -> 1 Hz
+    // Wire the controller: poll the meter at 1 Hz and log every cycle
     Controller controller(meterHld, std::chrono::seconds(1));
     controller.setLogService(&logHld);
 
-    // --- Verbindingen openen --------------------------------------------------
+    // Bring up the meter link first — without it there's nothing to poll
     if (!meterLld.connect())
     {
-        std::cerr << "Kan niet verbinden met IEM3250\n";
+        std::cerr << "Cannot connect to IEM3250\n";
         return 1;
     }
-    std::cout << "Verbonden met IEM3250\n";
+    std::cout << "Connected to IEM3250\n";
 
-    // Start de buffer-worker: die probeert zelf te (re)connecten met FLOG.
-    // Het systeem draait sowieso door, ook als de logServer nu offline is.
+    // Start the logging worker thread (FLOG connect happens lazily inside)
     bufferedFlog.connect();
 
-    // --- Optie 1: eenmalig handmatig pollen -----------------------------------
-    std::cout << "\n[pollOnce] Eenmalige meting:\n";
+    // One synchronous poll for immediate feedback at startup
+    std::cout << "\n[pollOnce] Single measurement:\n";
     controller.pollOnce();
     printMeasurement(controller.getLatestMeasurement());
 
-    // --- Optie 2: Automatic polling with callback
+    // Hook printing into every subsequent measurement
     controller.onMeasurement([](const MeterMeasurement &m)
                              { printMeasurement(m); });
 
     std::cout.flush();
+    // Kick off the polling thread
     controller.start();
 
-    // Run for 3 seconds
-    // Allow runtime control: optional first arg = seconds to run.
-    // If omitted, default to 3 seconds. If <= 0, run until Ctrl-C.
+    // Allow Ctrl-C to gracefully exit the run-forever path
     std::signal(SIGINT, handleSigint);
 
+    // Parse optional run-duration argument (seconds)
     int runSeconds = 3;
     if (argc > 1)
     {
@@ -114,6 +97,7 @@ int main(int argc, char *argv[])
         }
     }
 
+    // Either run for a fixed duration, or block until Ctrl-C
     if (runSeconds > 0)
     {
         std::this_thread::sleep_for(std::chrono::seconds(runSeconds));
@@ -127,10 +111,8 @@ int main(int argc, char *argv[])
         }
     }
 
-    // Stop
+    // Shut down in reverse order of bring-up
     controller.stop();
-
-    // bufferedFlog.disconnect() stopt de worker-thread én disconnect'et de FLOG.
     bufferedFlog.disconnect();
     meterLld.disconnect();
     return 0;

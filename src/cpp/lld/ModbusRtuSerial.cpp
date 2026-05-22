@@ -13,17 +13,8 @@
 #include <thread>
 #include <chrono>
 
-// Modbus RTU requires ≥3.5 character times of silence between frames.
-// At 38400 8E1 (11 bits/char) that's ~1.0 ms; at 19200 ~2.0 ms; at 9600 ~4.0 ms.
-// We use a fixed 5 ms guard which is comfortable above t3.5 for all supported
-// baud rates and still fits the 1 Hz measurement budget (18 reads × 5 ms = 90 ms).
-static constexpr auto MODBUS_T35_GUARD = std::chrono::milliseconds(5);
 
-// ---------------------------------------------------------------------------
-// Failure-reason counters (file-local). Lets us tell apart
-// master->slave damage from slave->master damage without needing
-// Modbus diagnostics on the meter (the iEM3250 doesn't expose them).
-// ---------------------------------------------------------------------------
+static constexpr auto MODBUS_T35_GUARD = std::chrono::milliseconds(5);
 namespace {
 
 struct Counters {
@@ -60,11 +51,8 @@ void logModbusStats(const char* tag)
               << '\n';
 }
 
-} // namespace
+} 
 
-// ---------------------------------------------------------------------------
-// Construction / destruction
-// ---------------------------------------------------------------------------
 
 ModbusRtuSerial::ModbusRtuSerial()
     : fd_(-1), deviceId_(1), timeoutMs_(2000)
@@ -77,15 +65,14 @@ ModbusRtuSerial::~ModbusRtuSerial()
     logModbusStats("final");
 }
 
-// ---------------------------------------------------------------------------
-// IIEM3250Communication
-// ---------------------------------------------------------------------------
+
 
 bool ModbusRtuSerial::connect(const std::string &port,
                               int deviceId,
                               int baudRate,
                               int timeoutMs)
 {
+    // Close any previous connection first
     if (fd_ != -1)
     {
         disconnect();
@@ -94,13 +81,14 @@ bool ModbusRtuSerial::connect(const std::string &port,
     deviceId_ = deviceId;
     timeoutMs_ = timeoutMs;
 
+    // Open serial port (blocking, no controlling tty)
     fd_ = ::open(port.c_str(), O_RDWR | O_NOCTTY | O_SYNC);
     if (fd_ < 0)
     {
         return false;
     }
 
-    // --- Configure serial port -------------------------------------------------
+    // Fetch current termios attributes
     struct termios tty{};
     if (::tcgetattr(fd_, &tty) != 0)
     {
@@ -109,7 +97,7 @@ bool ModbusRtuSerial::connect(const std::string &port,
         return false;
     }
 
-    // Baud rate
+    // Map numeric baud rate to termios speed constant
     speed_t speed = B19200;
     switch (baudRate)
     {
@@ -150,10 +138,10 @@ bool ModbusRtuSerial::connect(const std::string &port,
     tty.c_lflag = 0; // raw mode
     tty.c_oflag = 0; // raw output
 
-    // Non-blocking read with timeout handled via select()
     tty.c_cc[VMIN] = 0;
     tty.c_cc[VTIME] = 0;
 
+    // Apply termios settings immediately
     if (::tcsetattr(fd_, TCSANOW, &tty) != 0)
     {
         ::close(fd_);
@@ -161,6 +149,7 @@ bool ModbusRtuSerial::connect(const std::string &port,
         return false;
     }
 
+    // Discard any stale bytes in the kernel buffers
     ::tcflush(fd_, TCIOFLUSH);
     return true;
 }
@@ -188,9 +177,7 @@ bool ModbusRtuSerial::readHoldingRegisters(uint16_t address,
         return false;
     }
 
-    // Enforce Modbus RTU t3.5 inter-frame silence. Without this the meter
-    // can merge our request into the tail of its previous reply, which shows
-    // up as timeout0 (no answer) and CRC errors (collision on the bus).
+    // Respect the Modbus 3.5-char inter-frame silence
     const auto nextAllowed = lastBusActivity_ + MODBUS_T35_GUARD;
     const auto now = std::chrono::steady_clock::now();
     if (now < nextAllowed)
@@ -198,9 +185,11 @@ bool ModbusRtuSerial::readHoldingRegisters(uint16_t address,
         std::this_thread::sleep_for(nextAllowed - now);
     }
 
+    // Flush stale bytes and bump the request counter
     ::tcflush(fd_, TCIOFLUSH);
     ++counters.total;
 
+    // Transmit the read request
     if (!sendReadRequest(address, count))
     {
         ++counters.sendFail;
@@ -208,9 +197,11 @@ bool ModbusRtuSerial::readHoldingRegisters(uint16_t address,
         return false;
     }
 
+    // Wait for and parse the response
     const bool ok = receiveReadResponse(count, data);
     lastBusActivity_ = std::chrono::steady_clock::now();
 
+    // Periodic stats dump
     if (counters.total % LOG_EVERY == 0)
     {
         logModbusStats("periodic");
@@ -219,14 +210,9 @@ bool ModbusRtuSerial::readHoldingRegisters(uint16_t address,
     return ok;
 }
 
-// ---------------------------------------------------------------------------
-// Private helpers
-// ---------------------------------------------------------------------------
-
 bool ModbusRtuSerial::sendReadRequest(uint16_t address, uint16_t count)
 {
-    // Modbus RTU Read Holding Registers (FC 0x03)
-    // Frame: [deviceId, 0x03, addrHi, addrLo, cntHi, cntLo, CRClo, CRChi]
+    // Build the 8-byte Modbus RTU read-holding-registers PDU
     uint8_t request[8];
     request[0] = static_cast<uint8_t>(deviceId_);
     request[1] = 0x03; // function code
@@ -235,10 +221,12 @@ bool ModbusRtuSerial::sendReadRequest(uint16_t address, uint16_t count)
     request[4] = static_cast<uint8_t>(count >> 8);
     request[5] = static_cast<uint8_t>(count & 0xFF);
 
+    // Append CRC16 (low byte first)
     uint16_t crc = crc16(request, 6);
-    request[6] = static_cast<uint8_t>(crc & 0xFF); // CRC low byte first
+    request[6] = static_cast<uint8_t>(crc & 0xFF);
     request[7] = static_cast<uint8_t>(crc >> 8);
 
+    // Push the frame to the serial port
     ssize_t written = ::write(fd_, request, 8);
     if (written != 8)
     {
@@ -257,20 +245,18 @@ bool ModbusRtuSerial::receiveReadResponse(uint16_t expectedCount,
     const size_t expectedLen = 3u + static_cast<size_t>(expectedCount) * 2u + 2u;
     std::vector<uint8_t> buf(expectedLen, 0);
 
-    // Note: do not flush the input buffer here. The TCIOFLUSH at the start of
-    // readHoldingRegisters already cleared stale data, and by the time tcdrain
-    // returns the slave may already have started replying — flushing now would
-    // discard the first byte(s) of the response and surface as badHeader/CRC.
 
     auto startTime = std::chrono::steady_clock::now();
     size_t received = 0;
 
+    // Read loop: keep pulling bytes until the full frame is in or we time out
     while (received < expectedLen)
     {
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(fd_, &rfds);
 
+        // Compute how much of the overall timeout budget is left
         auto now = std::chrono::steady_clock::now();
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - startTime).count();
         int remaining = timeoutMs_ - static_cast<int>(elapsed);
@@ -285,6 +271,7 @@ bool ModbusRtuSerial::receiveReadResponse(uint16_t expectedCount,
         tv.tv_sec = remaining / 1000;
         tv.tv_usec = (remaining % 1000) * 1000;
 
+        // Wait for the fd to become readable within the remaining budget
         int ret = ::select(fd_ + 1, &rfds, nullptr, nullptr, &tv);
         if (ret <= 0)
         {
@@ -292,6 +279,7 @@ bool ModbusRtuSerial::receiveReadResponse(uint16_t expectedCount,
             return false; // timeout or error
         }
 
+        // Pull whatever bytes are available right now
         ssize_t n = ::read(fd_, buf.data() + received, expectedLen - received);
         if (n <= 0)
         {
@@ -342,10 +330,12 @@ bool ModbusRtuSerial::receiveReadResponse(uint16_t expectedCount,
 
 uint16_t ModbusRtuSerial::crc16(const uint8_t *buf, size_t len)
 {
+    // Standard Modbus CRC-16 (polynomial 0xA001, init 0xFFFF)
     uint16_t crc = 0xFFFF;
     for (size_t i = 0; i < len; ++i)
     {
         crc ^= buf[i];
+        // Process each bit of the current byte
         for (int j = 0; j < 8; ++j)
         {
             if (crc & 0x0001)

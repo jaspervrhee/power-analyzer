@@ -12,23 +12,14 @@
 #include <gpiod.h>
 #endif
 
-// Deadline-based retry strategy: keep retrying failed reads until the
-// measurement budget is exhausted, then write sentinels for the rest.
-// Guarantees 1 Hz cycle (caller calls us once/sec) regardless of fail rate.
+
 static constexpr auto MEASUREMENT_BUDGET = std::chrono::milliseconds(900);
 static constexpr float INVALID_SENTINEL  = -9999.0f;
-
-// After this many consecutive failures on the same register, slip a read of a
-// *different* register in front of the next retry. Goal: break any timing-lock
-// with periodic bus noise by changing the request bytes and the spacing.
 static constexpr int SACRIFICIAL_THRESHOLD = 3;
 
-// Per-attempt jittered backoff. Random component breaks lock-step with any
-// periodic noise source (mains harmonics, VFD switching) that would otherwise
-// hit the exact same fault window on every retry. Growing base gives the bus
-// time to settle after a noise burst.
 static std::chrono::milliseconds retryBackoff(int failCount, std::mt19937& rng)
 {
+    // Pick base delay + jitter for the current retry attempt
     int base = 0;
     int jitter = 0;
     switch (failCount)
@@ -39,6 +30,7 @@ static std::chrono::milliseconds retryBackoff(int failCount, std::mt19937& rng)
     case 3:  base = 80;  jitter = 40; break;
     default: base = 150; jitter = 50; break;
     }
+    // Add random jitter to avoid lock-step retry storms
     std::uniform_int_distribution<int> dist(0, jitter);
     return std::chrono::milliseconds(base + dist(rng));
 }
@@ -73,19 +65,11 @@ static constexpr int MODBUS_OFFSET = -2;
 
 namespace {
 
-// One Modbus transaction reading exactly one float32 (= 2 registers).
-// On failure we put the index back at the end of the queue, giving it the
-// time of all other reads as natural backoff before the next attempt.
 struct SingleRead {
     uint16_t regAddr;
     float*   outValue;
 };
 
-// ---------------------------------------------------------------------------
-// Cycle-level quality counters. The real KPI is not per-transaction CRC rate
-// but: did we get all 18 reads in the 1 Hz budget? Each cycle either lands
-// all 18 (complete) or writes one or more sentinels (incomplete).
-// ---------------------------------------------------------------------------
 struct CycleCounters {
     uint64_t totalCycles      = 0;
     uint64_t completeCycles   = 0;
@@ -114,15 +98,7 @@ void logCycleStats()
               << completePct << "%\n";
 }
 
-// ---------- Raspberry Pi GPIO fail-trigger (libgpiod v2) ----------
-// Pulses a GPIO pin HIGH on every failed Modbus transaction so an
-// oscilloscope on that pin can trigger exactly on the moment of failure.
-// Diagnostic only — remove the calls in tryBurstOnce when no longer needed.
-// No-op on non-Linux builds (Windows stub-mode keeps compiling).
-//
-// Requires: apt install libgpiod-dev   (Debian Trixie ships libgpiod v2.2)
-// 40-pin header on Pi 3/4/5 typically maps to /dev/gpiochip0 — run
-// `gpiodetect` on the Pi if unsure.
+
 constexpr const char* GPIO_CHIP_PATH = "/dev/gpiochip0";
 constexpr unsigned    GPIO_FAIL_PIN  = 18;   // BCM offset — header pin 12
 constexpr int         FAIL_PULSE_MS  = 5;
@@ -133,8 +109,10 @@ gpiod_line_request* gpioRequest = nullptr;
 
 void gpioInit()
 {
+    // Already initialized
     if (gpioRequest) return;
 
+    // Open the gpiochip device
     gpioChip = gpiod_chip_open(GPIO_CHIP_PATH);
     if (!gpioChip) {
         std::cerr << "[IEM3250] gpiod_chip_open(\"" << GPIO_CHIP_PATH
@@ -142,6 +120,7 @@ void gpioInit()
         return;
     }
 
+    // Allocate libgpiod config objects
     gpiod_line_settings* settings = gpiod_line_settings_new();
     gpiod_line_config*   lineCfg  = gpiod_line_config_new();
     gpiod_request_config* reqCfg  = gpiod_request_config_new();
@@ -155,9 +134,11 @@ void gpioInit()
         return;
     }
 
+    // Configure pin as output, initially low
     gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_OUTPUT);
     gpiod_line_settings_set_output_value(settings, GPIOD_LINE_VALUE_INACTIVE);
 
+    // Attach the settings to our single fail-trigger line
     const unsigned offset = GPIO_FAIL_PIN;
     if (gpiod_line_config_add_line_settings(lineCfg, &offset, 1, settings) < 0) {
         std::cerr << "[IEM3250] gpiod_line_config_add_line_settings failed — fail-trigger disabled\n";
@@ -169,10 +150,13 @@ void gpioInit()
         return;
     }
 
+    // Tag the request so other tools can see who owns the line
     gpiod_request_config_set_consumer(reqCfg, "power-analyzer");
 
+    // Actually claim the line
     gpioRequest = gpiod_chip_request_lines(gpioChip, reqCfg, lineCfg);
 
+    // Free the temporary config objects (the request now owns the state)
     gpiod_request_config_free(reqCfg);
     gpiod_line_config_free(lineCfg);
     gpiod_line_settings_free(settings);
@@ -188,6 +172,7 @@ void gpioInit()
 void gpioPulseFailure()
 {
     if (!gpioRequest) return;
+    // Drive the fail-trigger line high for a short pulse, then back low
     gpiod_line_request_set_value(gpioRequest, GPIO_FAIL_PIN, GPIOD_LINE_VALUE_ACTIVE);
     std::this_thread::sleep_for(std::chrono::milliseconds(FAIL_PULSE_MS));
     gpiod_line_request_set_value(gpioRequest, GPIO_FAIL_PIN, GPIOD_LINE_VALUE_INACTIVE);
@@ -195,11 +180,13 @@ void gpioPulseFailure()
 
 void gpioCleanup()
 {
+    // Release the line first (leave it low to be safe)
     if (gpioRequest) {
         gpiod_line_request_set_value(gpioRequest, GPIO_FAIL_PIN, GPIOD_LINE_VALUE_INACTIVE);
         gpiod_line_request_release(gpioRequest);
         gpioRequest = nullptr;
     }
+    // Then close the chip handle
     if (gpioChip) {
         gpiod_chip_close(gpioChip);
         gpioChip = nullptr;
@@ -251,8 +238,10 @@ bool IEM3250LLD::readMeasurement(RawMeasurement &m)
         return false;
     }
 
+    // Stamp the measurement with the moment the cycle started
     m.measuredAt = std::chrono::system_clock::now();
 
+    // Map of register -> destination field for this cycle
     std::vector<SingleRead> reads = {
         {Reg::I1,        &m.currentL1},
         {Reg::I2,        &m.currentL2},
@@ -274,8 +263,10 @@ bool IEM3250LLD::readMeasurement(RawMeasurement &m)
         {Reg::FREQUENCY, &m.frequency},
     };
 
+    // Hard deadline for the whole cycle
     const auto deadline = std::chrono::steady_clock::now() + MEASUREMENT_BUDGET;
 
+    // Start with every read pending
     std::vector<size_t> pending;
     pending.reserve(reads.size());
     for (size_t i = 0; i < reads.size(); ++i)
@@ -283,12 +274,12 @@ bool IEM3250LLD::readMeasurement(RawMeasurement &m)
         pending.push_back(i);
     }
 
+    // Per-register failure counter (drives backoff and sacrificial reads)
     std::vector<int> failCount(reads.size(), 0);
 
-    // Single shared RNG across calls — cheap to construct, harmless if
-    // readMeasurement is ever called concurrently (we don't need crypto-grade).
     static std::mt19937 rng{std::random_device{}()};
 
+    // Retry rounds until everything is read or the deadline hits
     int round = 0;
     while (!pending.empty())
     {
@@ -296,15 +287,14 @@ bool IEM3250LLD::readMeasurement(RawMeasurement &m)
         std::vector<size_t> stillFailing;
         for (size_t idx : pending)
         {
+            // Out of budget — give up on this read
             if (std::chrono::steady_clock::now() >= deadline)
             {
-                // Out of time — push the rest unchecked; they'll be sentinelled below.
                 stillFailing.push_back(idx);
                 continue;
             }
 
-            // Jittered, growing backoff before retrying a register that has
-            // already failed in this measurement cycle.
+            // Apply backoff before retrying a previously failed read
             if (failCount[idx] > 0)
             {
                 const auto backoff = retryBackoff(failCount[idx], rng);
@@ -314,9 +304,7 @@ bool IEM3250LLD::readMeasurement(RawMeasurement &m)
                 }
             }
 
-            // After repeated failures, slip in a read of a different register
-            // before the real retry. Different request bytes, different timing,
-            // forces the meter into a new transaction context — breaks the lock.
+            // After repeated failures, do a throwaway read to nudge the bus
             if (failCount[idx] >= SACRIFICIAL_THRESHOLD)
             {
                 const size_t sacIdx = (idx + 1) % reads.size();
@@ -326,6 +314,7 @@ bool IEM3250LLD::readMeasurement(RawMeasurement &m)
                 comm_.readHoldingRegisters(sacAddr, 2, sacRegs); // result discarded
             }
 
+            // The actual read attempt
             const auto& r = reads[idx];
             std::vector<FloatExtract> extracts = { {r.regAddr, 0, r.outValue} };
             if (!tryBurstOnce(r.regAddr, 2, extracts))
@@ -336,24 +325,28 @@ bool IEM3250LLD::readMeasurement(RawMeasurement &m)
         }
         pending = std::move(stillFailing);
 
+        // Stop conditions
         if (pending.empty()) break;
         if (std::chrono::steady_clock::now() >= deadline) break;
-        // No inter-round delay — per-read jittered backoff above handles spacing.
     }
 
     const bool ok = pending.empty();
+
+    // Report unfinished reads
     if (!pending.empty())
     {
         std::cerr << "[IEM3250] " << pending.size() << " of " << reads.size()
                   << " reads unfinished after " << round << " rounds (deadline) — "
                   << "writing sentinel " << INVALID_SENTINEL << " to those\n";
     }
+    // Fill the unfinished slots with the invalid sentinel
     for (size_t idx : pending)
     {
         const auto& r = reads[idx];
         *r.outValue = INVALID_SENTINEL;
     }
 
+    // Update cycle stats
     ++cycleCounters.totalCycles;
     if (ok)
     {
@@ -366,11 +359,13 @@ bool IEM3250LLD::readMeasurement(RawMeasurement &m)
         cycleCounters.totalSentinels += n;
         if (n > cycleCounters.worstSentinels) cycleCounters.worstSentinels = n;
     }
+    // Periodic stats dump
     if (cycleCounters.totalCycles % CYCLE_LOG_EVERY == 0)
     {
         logCycleStats();
     }
 
+    // IEM3250 reports PF outside [-1,1] for leading/lagging — fold it back
     if (m.powerFactor != INVALID_SENTINEL)
     {
         if (m.powerFactor > 1.0f)
@@ -386,21 +381,25 @@ bool IEM3250LLD::tryBurstOnce(uint16_t startReg,
                               uint16_t regCount,
                               const std::vector<FloatExtract>& extracts)
 {
+    // Convert the datasheet register number to a Modbus PDU address
     const auto modbusAddr = static_cast<uint16_t>(
         static_cast<int>(startReg) + MODBUS_OFFSET);
 
+    // Issue the burst read
     std::vector<uint16_t> regs;
     if (!comm_.readHoldingRegisters(modbusAddr, regCount, regs))
     {
         gpioPulseFailure();
         return false;
     }
+    // Short reply — treat as a failure too
     if (regs.size() < regCount)
     {
         gpioPulseFailure();
         return false;
     }
 
+    // Decode every requested float out of the register block
     for (const auto& ext : extracts)
     {
         *ext.outValue = decodeCDAB(regs[ext.offsetInBlock],
@@ -411,6 +410,7 @@ bool IEM3250LLD::tryBurstOnce(uint16_t startReg,
 
 float IEM3250LLD::decodeCDAB(uint16_t regLow, uint16_t regHigh)
 {
+    // Recombine the two 16-bit words into a 32-bit IEEE-754 float (CDAB order)
     const uint32_t raw = (static_cast<uint32_t>(regHigh) << 16) |
                          static_cast<uint32_t>(regLow);
     float f;

@@ -3,29 +3,28 @@
 #include "common/MeterData.h"
 
 /**
- * IMeterService
+ * @brief Service interface for retrieving validated meter measurements.
  *
- * Exposes meter-independent measurement functionality to the Controller.
- * Values are validated and interpreted; all hardware and protocol details
- * are hidden behind this interface.
- * Implemented by MeterHLD.
+ * Exposes the meter to higher layers (e.g. Controller) without coupling
+ * them to a specific driver or transport. Implemented by MeterHLD.
  */
 class IMeterService {
 public:
     virtual ~IMeterService() = default;
 
     /**
-     * @return true when a meter is connected and delivering valid data.
+     * @brief Check whether the underlying meter is reachable.
+     * @return true when the meter is connected and ready to deliver data.
      */
     virtual bool isAvailable() const = 0;
 
     /**
-     * Retrieve the latest validated measurement snapshot.
+     * @brief Retrieve the latest validated measurement snapshot.
      *
-     * @param measurement  Output: populated on success; measurement.valid is
-     *                     set to false when data could not be obtained or
-     *                     failed validation.
-     * @return true when measurement.valid is true
+     * @param[out] measurement  Populated on success; @c measurement.valid is
+     *                          set to false when data could not be obtained
+     *                          or failed validation.
+     * @return true when @c measurement.valid is true.
      */
     virtual bool getMeasurement(MeterMeasurement& measurement) = 0;
 };

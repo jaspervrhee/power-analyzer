@@ -1,45 +1,29 @@
 #include "lld/FLOG_LLD.h"
 
-#include <climits>
 #include <iostream>
 #include <sstream>
 
-#ifdef _WIN32
-#  define WIN32_LEAN_AND_MEAN
-#  include <winsock2.h>
-#  include <ws2tcpip.h>
-#  pragma comment(lib, "ws2_32.lib")
-   using NativeSocket = SOCKET;
-#  define FLOG_INVALID_SOCKET INVALID_SOCKET
-#  define FLOG_CLOSE(s)       closesocket(s)
-static int flogLastError() { return WSAGetLastError(); }
-#else
-#  include <arpa/inet.h>
-#  include <errno.h>
-#  include <fcntl.h>
-#  include <netdb.h>
-#  include <netinet/tcp.h>
-#  include <sys/select.h>
-#  include <sys/socket.h>
-#  include <sys/time.h>
-#  include <unistd.h>
-   using NativeSocket = int;
-#  define FLOG_INVALID_SOCKET (-1)
-#  define FLOG_CLOSE(s)       ::close(s)
-static int flogLastError() { return errno; }
-#endif
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/tcp.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
 
 
 static constexpr int CONNECT_TIMEOUT_SEC = 2;
-// Caps how long a single send() call can block on a half-dead socket.
 static constexpr int SEND_TIMEOUT_MS     = 5000;
 
-static void enableTcpKeepalive(NativeSocket sock)
+static void enableTcpKeepalive(int sock)
 {
+    // Enable SO_KEEPALIVE
     int one = 1;
-    setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE,
-               reinterpret_cast<const char*>(&one), sizeof(one));
-#ifdef __linux__
+    setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+
+    // Aggressive keepalive timings: probe quickly so dead links are noticed fast
     int idle  = 5;
     int intvl = 2;
     int cnt   = 3;
@@ -47,11 +31,8 @@ static void enableTcpKeepalive(NativeSocket sock)
     setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
     setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
 
-    // TCP_USER_TIMEOUT: abort the connection when data has gone unacked for
-    // this many milliseconds. Keepalive only fires during *idle* periods; we
-    // send every 1s so the idle counter is constantly reset. Without this,
-    // a pulled cable takes tcp_retries2 (~15 min) to be noticed.
-#  ifdef TCP_USER_TIMEOUT
+#ifdef TCP_USER_TIMEOUT
+    // Cap retransmission stalls so send() fails fast on broken links
     unsigned int userTimeoutMs = 10000;
     if (setsockopt(sock, IPPROTO_TCP, TCP_USER_TIMEOUT,
                    &userTimeoutMs, sizeof(userTimeoutMs)) == 0) {
@@ -60,69 +41,48 @@ static void enableTcpKeepalive(NativeSocket sock)
         std::cerr << "[FLOG] TCP_USER_TIMEOUT setsockopt failed (errno="
                   << errno << ")\n";
     }
-#  else
+#else
     std::cerr << "[FLOG] TCP_USER_TIMEOUT not available in headers\n";
-#  endif
+#endif
 
-    // Shrink the send buffer so a stalled TCP connection applies
-    // back-pressure quickly: once the buffer is full, send() blocks and
-    // our SO_SNDTIMEO kicks in instead of the data silently piling up
-    // in the kernel for hundreds of seconds.
+    // Small send buffer so a stalled link backs up immediately
     int sndbuf = 4096;
     setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-#endif
 }
 
-// Cap single send() calls so a half-dead socket cannot hang the worker.
-static void enableSendTimeout(NativeSocket sock, int timeoutMs)
+static void enableSendTimeout(int sock, int timeoutMs)
 {
-#ifdef _WIN32
-    const DWORD timeout = static_cast<DWORD>(timeoutMs);
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO,
-               reinterpret_cast<const char*>(&timeout), sizeof(timeout));
-#else
     timeval tv{};
     tv.tv_sec  = timeoutMs / 1000;
     tv.tv_usec = (timeoutMs % 1000) * 1000;
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-#endif
 }
 
-static bool setNonBlocking(NativeSocket sock, bool nonBlocking)
+static bool setNonBlocking(int sock, bool nonBlocking)
 {
-#ifdef _WIN32
-    u_long mode = nonBlocking ? 1u : 0u;
-    return ioctlsocket(sock, FIONBIO, &mode) == 0;
-#else
     int flags = fcntl(sock, F_GETFL, 0);
     if (flags == -1) return false;
     flags = nonBlocking ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK);
     return fcntl(sock, F_SETFL, flags) == 0;
-#endif
 }
 
-// Issue connect() non-blocking and wait at most timeoutSec for completion.
-// Returns true iff the connection is established; leaves the socket in
-// blocking mode on success.
-static bool tryConnectWithTimeout(NativeSocket sock,
+static bool tryConnectWithTimeout(int sock,
                                   const sockaddr* addr,
                                   std::size_t addrLen,
                                   int timeoutSec)
 {
+    // Flip to non-blocking so connect() returns immediately
     if (!setNonBlocking(sock, true)) return false;
 
-    const int rc = ::connect(sock, addr, static_cast<int>(addrLen));
+    // Kick off the connection
+    const int rc = ::connect(sock, addr, static_cast<socklen_t>(addrLen));
     if (rc == 0) {
+        // Connected synchronously (e.g. loopback) — restore blocking
         return setNonBlocking(sock, false);
     }
+    if (errno != EINPROGRESS) return false;
 
-#ifdef _WIN32
-    const bool inProgress = (WSAGetLastError() == WSAEWOULDBLOCK);
-#else
-    const bool inProgress = (errno == EINPROGRESS);
-#endif
-    if (!inProgress) return false;
-
+    // Wait until the socket becomes writable, or we time out
     fd_set wfds;
     FD_ZERO(&wfds);
     FD_SET(sock, &wfds);
@@ -130,69 +90,21 @@ static bool tryConnectWithTimeout(NativeSocket sock,
     tv.tv_sec  = timeoutSec;
     tv.tv_usec = 0;
 
-#ifdef _WIN32
-    const int selectRc = select(0, nullptr, &wfds, nullptr, &tv);
-#else
-    const int selectRc = select(static_cast<int>(sock) + 1,
-                                nullptr, &wfds, nullptr, &tv);
-#endif
+    const int selectRc = select(sock + 1, nullptr, &wfds, nullptr, &tv);
     if (selectRc <= 0) return false; // timeout or select error
 
+    // Check whether the connect actually succeeded
     int soError = 0;
-#ifdef _WIN32
-    int optLen = sizeof(soError);
-#else
     socklen_t optLen = sizeof(soError);
-#endif
-    if (getsockopt(sock, SOL_SOCKET, SO_ERROR,
-                   reinterpret_cast<char*>(&soError), &optLen) != 0) {
+    if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &soError, &optLen) != 0) {
         return false;
     }
     if (soError != 0) return false;
 
+    // Restore blocking mode for the rest of the session
     return setNonBlocking(sock, false);
 }
 
-namespace {
-
-#ifdef _WIN32
-// Reference-counted WSAStartup so multiple FLOG_LLD instances coexist.
-class WsaInit {
-public:
-    bool acquire()
-    {
-        std::lock_guard<std::mutex> lock(m_);
-        if (refs_ == 0) {
-            WSADATA data;
-            if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return false;
-        }
-        ++refs_;
-        return true;
-    }
-    void release()
-    {
-        std::lock_guard<std::mutex> lock(m_);
-        if (refs_ > 0 && --refs_ == 0) {
-            WSACleanup();
-        }
-    }
-private:
-    std::mutex m_;
-    int        refs_ = 0;
-};
-WsaInit& wsa() { static WsaInit w; return w; }
-#endif
-
-NativeSocket toNative(std::int64_t fd)
-{
-    return static_cast<NativeSocket>(fd);
-}
-
-} // namespace
-
-// ---------------------------------------------------------------------------
-// Construction / destruction
-// ---------------------------------------------------------------------------
 
 FLOG_LLD::FLOG_LLD(std::string host, std::uint16_t port)
     : host_(std::move(host))
@@ -204,22 +116,12 @@ FLOG_LLD::~FLOG_LLD()
     disconnect();
 }
 
-// ---------------------------------------------------------------------------
-// ILogBackend
-// ---------------------------------------------------------------------------
-
 bool FLOG_LLD::connect()
 {
     std::lock_guard<std::mutex> lock(mutex_);
     if (connected_.load()) return true;
 
-#ifdef _WIN32
-    if (!wsa().acquire()) {
-        std::cerr << "[FLOG] WSAStartup failed\n";
-        return false;
-    }
-#endif
-
+    // Resolve host:port to one or more sockaddrs (v4/v6)
     addrinfo hints{};
     hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -228,38 +130,35 @@ bool FLOG_LLD::connect()
     const std::string portStr = std::to_string(port_);
     if (getaddrinfo(host_.c_str(), portStr.c_str(), &hints, &res) != 0 || !res) {
         std::cerr << "[FLOG] getaddrinfo failed for " << host_ << ':' << port_ << '\n';
-#ifdef _WIN32
-        wsa().release();
-#endif
         return false;
     }
 
-    NativeSocket sock = FLOG_INVALID_SOCKET;
+    // Walk the resolved addresses until one connects within the timeout
+    int sock = -1;
     for (addrinfo* a = res; a != nullptr; a = a->ai_next) {
-        NativeSocket s = ::socket(a->ai_family, a->ai_socktype, a->ai_protocol);
-        if (s == FLOG_INVALID_SOCKET) continue;
+        int s = ::socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+        if (s == -1) continue;
         if (tryConnectWithTimeout(s, a->ai_addr, a->ai_addrlen,
                                   CONNECT_TIMEOUT_SEC)) {
             sock = s;
             break;
         }
-        FLOG_CLOSE(s);
+        ::close(s);
     }
     freeaddrinfo(res);
 
-    if (sock == FLOG_INVALID_SOCKET) {
+    if (sock == -1) {
         std::cerr << "[FLOG] connect to " << host_ << ':' << port_
-                  << " failed (err=" << flogLastError() << ")\n";
-#ifdef _WIN32
-        wsa().release();
-#endif
+                  << " failed (err=" << errno << ")\n";
         return false;
     }
 
+    // Tune the socket for fast failure detection
     enableTcpKeepalive(sock);
     enableSendTimeout(sock, SEND_TIMEOUT_MS);
 
-    socketFd_ = static_cast<std::int64_t>(sock);
+    // Adopt the socket and reset the per-connection state
+    socketFd_ = sock;
     tableRefs_.clear();
     nextRef_ = 0;
     connected_.store(true);
@@ -308,22 +207,22 @@ bool FLOG_LLD::send(const LogEntry& entry)
     return sendLineLocked(os.str());
 }
 
-// ---------------------------------------------------------------------------
-// Private
-// ---------------------------------------------------------------------------
 
 int FLOG_LLD::ensureTableRef(const std::string& path,
                              const std::string& tableName,
                              const std::vector<std::string>& columns)
 {
+    // Already registered? Reuse the existing ref
     const TableKey key{path, tableName};
     auto it = tableRefs_.find(key);
     if (it != tableRefs_.end()) {
         return it->second;
     }
 
+    // Allocate a fresh ref id for this table
     const int ref = nextRef_++;
 
+    // Build the @TABLE registration line
     std::ostringstream os;
     os << "@TABLE,ref=" << ref
        << ",path="      << path
@@ -334,11 +233,12 @@ int FLOG_LLD::ensureTableRef(const std::string& path,
         os << columns[i];
     }
 
+    // Send it; on failure the socket is already closed and the cache wiped
     if (!sendLineLocked(os.str())) {
-        // sendLineLocked has already closed the socket; registry was cleared.
         return -1;
     }
 
+    // Cache the mapping so future rows skip the registration
     tableRefs_[key] = ref;
     return ref;
 }
@@ -347,22 +247,19 @@ bool FLOG_LLD::sendLineLocked(const std::string& line)
 {
     if (!connected_.load()) return false;
 
+    // Append the line terminator
     std::string payload = line;
     payload.push_back('\n');
 
-    NativeSocket sock = toNative(socketFd_);
+    const int sock = static_cast<int>(socketFd_);
     const char* data      = payload.data();
     std::size_t remaining = payload.size();
 
+    // Write loop: handles partial sends, bails on any error
     while (remaining > 0) {
-#ifdef _WIN32
-        const int chunk = static_cast<int>(remaining > INT_MAX ? INT_MAX : remaining);
-        const int n     = ::send(sock, data, chunk, 0);
-#else
         const ssize_t n = ::send(sock, data, remaining, MSG_NOSIGNAL);
-#endif
         if (n <= 0) {
-            std::cerr << "[FLOG] send failed (err=" << flogLastError() << ")\n";
+            std::cerr << "[FLOG] send failed (err=" << errno << ")\n";
             closeSocketLocked();
             return false;
         }
@@ -374,18 +271,18 @@ bool FLOG_LLD::sendLineLocked(const std::string& line)
 
 void FLOG_LLD::closeSocketLocked()
 {
+    // Idempotent: only the first caller does the real teardown
     if (!connected_.exchange(false)) return;
 
-    NativeSocket sock = toNative(socketFd_);
-    if (sock != FLOG_INVALID_SOCKET) {
-        FLOG_CLOSE(sock);
+    // Close the underlying fd
+    const int sock = static_cast<int>(socketFd_);
+    if (sock != -1) {
+        ::close(sock);
     }
+    // Reset per-connection state (table refs must be re-registered next time)
     socketFd_ = -1;
     tableRefs_.clear();
     nextRef_ = 0;
 
-#ifdef _WIN32
-    wsa().release();
-#endif
     std::cout << "[FLOG] disconnected\n";
 }

@@ -5,20 +5,14 @@
 #include <iomanip>
 #include <sstream>
 
-// ---------------------------------------------------------------------------
-// Backend registration
-// ---------------------------------------------------------------------------
-
+// Registers a backend; from now on every log entry is also sent to it.
 void LogHLD::addBackend(ILogBackend& backend)
 {
     std::lock_guard<std::mutex> lock(backendsMutex_);
     backends_.push_back(&backend);
 }
 
-// ---------------------------------------------------------------------------
-// ILogService
-// ---------------------------------------------------------------------------
-
+// Returns true if at least one registered backend is connected.
 bool LogHLD::isAvailable() const
 {
     std::lock_guard<std::mutex> lock(backendsMutex_);
@@ -30,6 +24,7 @@ bool LogHLD::isAvailable() const
     return false;
 }
 
+// Builds a text LogEntry (timestamp, level, table, message) and dispatches it to all backends.
 void LogHLD::logMessage(LogLevel level,
                         const std::string& tablePath,
                         const std::string& tableName,
@@ -45,6 +40,7 @@ void LogHLD::logMessage(LogLevel level,
     dispatch(entry);
 }
 
+// Builds a measurement LogEntry (level Info if valid, otherwise Warning) and dispatches it to all backends.
 void LogHLD::logMeasurement(const MeterMeasurement& measurement)
 {
     LogEntry entry;
@@ -57,14 +53,11 @@ void LogHLD::logMeasurement(const MeterMeasurement& measurement)
     dispatch(entry);
 }
 
-// ---------------------------------------------------------------------------
-// Private
-// ---------------------------------------------------------------------------
 
+// Takes a snapshot of the backend list under lock and sends the entry to each connected backend outside the lock.
 void LogHLD::dispatch(const LogEntry& entry)
 {
-    // Snapshot the backend list so send() can do blocking I/O without
-    // serialising unrelated registrations on the same mutex.
+
     std::vector<ILogBackend*> snapshot;
     {
         std::lock_guard<std::mutex> lock(backendsMutex_);
@@ -77,10 +70,7 @@ void LogHLD::dispatch(const LogEntry& entry)
     }
 }
 
-// Format the measurement timestamp as "YYYY-MM-DD HH:MM:SS.mmm" — Excel/CSV
-// readers parse this directly as a date-time. Local time is used so the
-// column matches the operator's wall clock; if the Pi's TZ is UTC the values
-// will be UTC, which is fine as long as it's consistent.
+// Formats a time point as "YYYY-MM-DD HH:MM:SS.mmm" in local time (empty string for epoch-0).
 static std::string formatTimestamp(std::chrono::system_clock::time_point tp)
 {
     using namespace std::chrono;
@@ -90,22 +80,17 @@ static std::string formatTimestamp(std::chrono::system_clock::time_point tp)
     const auto t   = system_clock::to_time_t(tp);
     const auto ms  = duration_cast<milliseconds>(tp.time_since_epoch()) % 1000;
     std::tm tm{};
-#ifdef _WIN32
-    localtime_s(&tm, &t);
-#else
     localtime_r(&t, &tm);
-#endif
     std::ostringstream os;
     os << std::put_time(&tm, "%Y-%m-%d %H:%M:%S")
        << '.' << std::setw(3) << std::setfill('0') << ms.count();
     return os.str();
 }
 
+// Converts a float to string; NaN/Inf and near-zero (<1e-6) become "0" so spreadsheets do not break.
 static std::string f2s(float v)
 {
-    // NaN/Inf and sub-microunit noise are treated as 0 so the FLOG output
-    // stays parseable by spreadsheets (no "nan" -> #NAAM? cells) and is
-    // not polluted by denormalised near-zero readings from the meter.
+
     if (!std::isfinite(v) || std::fabs(v) < 1e-6f) {
         return "0";
     }
@@ -114,6 +99,7 @@ static std::string f2s(float v)
     return os.str();
 }
 
+// Fills parallel column and value vectors with all measurement fields in a fixed order.
 void LogHLD::fillMeasurementRow(const MeterMeasurement& m,
                                 std::vector<std::string>& columns,
                                 std::vector<std::string>& values)

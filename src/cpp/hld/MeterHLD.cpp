@@ -2,9 +2,7 @@
 
 #include <cmath>
 
-// ---------------------------------------------------------------------------
-// Plausibility bounds for validation
-// ---------------------------------------------------------------------------
+ 
 namespace Limits
 {
     static constexpr float CURRENT_MAX_A = 10000.0f;   // [A]
@@ -16,34 +14,31 @@ namespace Limits
     static constexpr float FREQ_MAX_HZ = 65.0f;
 } // namespace Limits
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
+// Returns true if v is a finite number and non-negative.
 static bool isFiniteAndNonNegative(float v)
 {
     return std::isfinite(v) && v >= 0.0f;
 }
 
+// Returns true if v is finite and lies within [minVal, maxVal].
 static bool inRange(float v, float minVal, float maxVal)
 {
     return std::isfinite(v) && v >= minVal && v <= maxVal;
 }
 
-// ---------------------------------------------------------------------------
-// MeterHLD
-// ---------------------------------------------------------------------------
-
+// Stores a reference to the underlying driver.
 MeterHLD::MeterHLD(IMeterDriver &driver)
     : driver_(driver)
 {
 }
 
+// Returns true if the underlying driver is connected.
 bool MeterHLD::isAvailable() const
 {
     return driver_.isConnected();
 }
 
+// Reads a raw measurement, validates it and populates the outgoing measurement struct.
 bool MeterHLD::getMeasurement(MeterMeasurement &measurement)
 {
     RawMeasurement raw{};
@@ -60,10 +55,8 @@ bool MeterHLD::getMeasurement(MeterMeasurement &measurement)
     return valid;
 }
 
-// ---------------------------------------------------------------------------
-// Private
-// ---------------------------------------------------------------------------
 
+// Checks that every field is free of NaN/Inf and within physically plausible bounds.
 bool MeterHLD::validate(const RawMeasurement &r)
 {
     // Currents — non-negative, within rated range
@@ -117,6 +110,7 @@ bool MeterHLD::validate(const RawMeasurement &r)
     return true;
 }
 
+// Copies all fields from a RawMeasurement into a MeterMeasurement and sets the valid flag.
 MeterMeasurement MeterHLD::toMeterMeasurement(const RawMeasurement &r, bool valid)
 {
     MeterMeasurement m{};

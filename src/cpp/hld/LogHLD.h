@@ -7,51 +7,75 @@
 #include <vector>
 
 /**
- * LogHLD — Log High Level Driver.
+ * @brief High Level Driver implementing ILogService.
  *
- * Exposes ILogService to the Controller and forwards every entry to
- * a set of registered ILogBackend implementations (FLOG_LLD, SDL_LLD, ...).
- *
- * Responsibilities:
- *  - Timestamp and format entries into a LogEntry.
- *  - Fan out to every registered backend.
- *  - Remain independent of any specific backend protocol.
- *
- * Adding a new backend: instantiate it, call addBackend(),
- * no other change in the HLD is required.
+ * Fans out every log entry to all registered ILogBackend instances. The HLD
+ * formats free-form messages and structured measurements into a LogEntry
+ * and dispatches them; individual backend failures do not affect siblings.
  */
 class LogHLD : public ILogService {
 public:
     LogHLD() = default;
     ~LogHLD() override = default;
 
-    // Non-copyable
+    /// @name Non-copyable
+    /// @{
     LogHLD(const LogHLD&)            = delete;
     LogHLD& operator=(const LogHLD&) = delete;
+    /// @}
 
     /**
-     * Register a backend. The caller retains ownership and must ensure
-     * the backend outlives this LogHLD. Multiple backends are supported;
-     * every log entry is forwarded to all of them.
+     * @brief Register a backend to receive every dispatched LogEntry.
+     *
+     * @param backend  Backend to attach. Caller retains ownership and must
+     *                 ensure it outlives this LogHLD.
      */
     void addBackend(ILogBackend& backend);
 
-    // --- ILogService -----------------------------------------------------------
+    /**
+     * @copydoc ILogService::isAvailable
+     * @return true when at least one registered backend is currently connected.
+     */
     bool isAvailable() const override;
 
+    /**
+     * @copydoc ILogService::logMessage
+     *
+     * Builds a LogEntry containing the timestamp, level and message and
+     * dispatches it to all backends.
+     */
     void logMessage(LogLevel level,
                     const std::string& tablePath,
                     const std::string& tableName,
                     const std::string& message) override;
 
+    /**
+     * @copydoc ILogService::logMeasurement
+     *
+     * Builds a LogEntry with the measurement encoded as parallel column/value
+     * vectors and dispatches it to all backends.
+     */
     void logMeasurement(const MeterMeasurement& measurement) override;
 
 private:
     mutable std::mutex        backendsMutex_;
     std::vector<ILogBackend*> backends_;
 
+    /**
+     * @brief Snapshot the backend list and send @p entry to each connected backend.
+     *
+     * The actual I/O is performed outside the lock to avoid blocking
+     * addBackend() / isAvailable() while a slow backend is writing.
+     */
     void dispatch(const LogEntry& entry);
 
+    /**
+     * @brief Populate parallel column and value vectors from a MeterMeasurement.
+     *
+     * @param[in]  m        Source measurement (includes formatted timestamp).
+     * @param[out] columns  Column names, cleared and refilled.
+     * @param[out] values   Stringified values aligned 1:1 with @p columns.
+     */
     static void fillMeasurementRow(const MeterMeasurement& m,
                                    std::vector<std::string>& columns,
                                    std::vector<std::string>& values);

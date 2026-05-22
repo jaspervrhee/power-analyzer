@@ -1,8 +1,5 @@
 #include "controller/Controller.h"
 
-// ---------------------------------------------------------------------------
-// Construction / destruction
-// ---------------------------------------------------------------------------
 
 Controller::Controller(IMeterService& meterService,
                        std::chrono::milliseconds interval)
@@ -17,9 +14,6 @@ Controller::~Controller()
     stop();
 }
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
 
 void Controller::onMeasurement(MeasurementCallback callback)
 {
@@ -31,24 +25,24 @@ void Controller::setLogService(ILogService* logService)
     logService_ = logService;
 }
 
-// ---------------------------------------------------------------------------
-// Lifecycle
-// ---------------------------------------------------------------------------
-
 void Controller::start()
 {
+    // Already running — nothing to do
     if (running_.load()) {
         return;
     }
+    // Mark running and spin up the polling thread
     running_.store(true);
     pollThread_ = std::thread(&Controller::pollLoop, this);
 }
 
 void Controller::stop()
 {
+    // Already stopped — nothing to do
     if (!running_.load()) {
         return;
     }
+    // Signal the loop to exit and wait for it
     running_.store(false);
     if (pollThread_.joinable()) {
         pollThread_.join();
@@ -60,9 +54,6 @@ bool Controller::isRunning() const
     return running_.load();
 }
 
-// ---------------------------------------------------------------------------
-// Measurement access
-// ---------------------------------------------------------------------------
 
 MeterMeasurement Controller::getLatestMeasurement() const
 {
@@ -72,18 +63,22 @@ MeterMeasurement Controller::getLatestMeasurement() const
 
 bool Controller::pollOnce()
 {
+    // Fetch a fresh measurement from the meter service
     MeterMeasurement m{};
     const bool ok = meterService_.getMeasurement(m);
 
+    // Publish it as the latest known measurement
     {
         std::lock_guard<std::mutex> lock(measurementMutex_);
         latestMeasurement_ = m;
     }
 
+    // Log every poll, even invalid ones (logger decides level)
     if (logService_) {
         logService_->logMeasurement(m);
     }
 
+    // Notify subscribers only on successful reads
     if (ok && callback_) {
         callback_(m);
     }
@@ -91,19 +86,16 @@ bool Controller::pollOnce()
     return ok;
 }
 
-// ---------------------------------------------------------------------------
-// Background loop
-// ---------------------------------------------------------------------------
 
 void Controller::pollLoop()
 {
-    // Schedule on an absolute clock so poll duration doesn't leak into the
-    // period: period == interval_ regardless of how long pollOnce() took.
     auto nextTick = std::chrono::steady_clock::now();
 
     while (running_.load()) {
+        // Do the work for this tick
         pollOnce();
 
+        // Schedule the next tick
         nextTick += interval_;
 
         // If pollOnce overran (bus unhealthy, heavy retries), skip missed
