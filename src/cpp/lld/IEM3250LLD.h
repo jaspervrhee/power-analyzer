@@ -12,7 +12,7 @@
  *
  * Implements IMeterDriver by issuing Modbus burst reads via an injected
  * IIEM3250Communication transport. Decodes the iEM3250's CDAB-ordered
- * float32 registers into a RawMeasurement. Performs no validation —
+ * float32 registers into a MeterMeasurement. Performs no validation —
  * range/finiteness checks live in MeterHLD.
  */
 class IEM3250LLD : public IMeterDriver {
@@ -60,7 +60,7 @@ public:
      * affected fields at their sentinel value and causes the call to
      * return false.
      */
-    bool readMeasurement(RawMeasurement& measurement) override;
+    bool readMeasurement(MeterMeasurement& measurement) override;
 
     /// @}
 

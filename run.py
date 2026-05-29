@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Build and run the power-analyzer C++ project
+Build and run the power-analyzer C++ project using CMake
 """
 
 import subprocess
 import sys
 import os
 import signal
+import platform
 from pathlib import Path
+
 
 def run_command(cmd, description):
     """Execute a command and report status"""
@@ -15,7 +17,7 @@ def run_command(cmd, description):
     print(f"[*] {description}")
     print(f"{'='*60}")
     print(f"Command: {' '.join(cmd)}\n")
-    
+
     try:
         result = subprocess.run(cmd, check=True)
         return result.returncode == 0
@@ -35,8 +37,12 @@ def run_and_forward(cmd, description):
     print(f"Command: {' '.join(cmd)}\n")
 
     try:
-        # Start child in its own process group so we can forward signals.
-        proc = subprocess.Popen(cmd, preexec_fn=os.setsid)
+        if platform.system() == "Windows":
+            # On Windows, just create the process normally
+            proc = subprocess.Popen(cmd)
+        else:
+            # On Unix/Linux, create a new process group for proper signal forwarding
+            proc = subprocess.Popen(cmd, preexec_fn=os.setsid)
     except FileNotFoundError as e:
         print(f"\n[ERROR] Command not found: {e}")
         return False
@@ -47,57 +53,83 @@ def run_and_forward(cmd, description):
     except KeyboardInterrupt:
         print("\n[INFO] Interrupted: forwarding SIGINT to child process...")
         try:
-            os.killpg(proc.pid, signal.SIGINT)
+            if platform.system() == "Windows":
+                proc.send_signal(signal.CTRL_C_EVENT)
+            else:
+                os.killpg(proc.pid, signal.SIGINT)
         except Exception:
             pass
         proc.wait()
         return False
 
+
 def main():
     # Get project root
     project_root = Path(__file__).parent
     cpp_dir = project_root / "src" / "cpp"
-    
+    build_dir = cpp_dir / "build"
+
     if not cpp_dir.exists():
         print(f"[ERROR] C++ directory not found: {cpp_dir}")
         sys.exit(1)
-    
-    os.chdir(cpp_dir)
-    print(f"Working directory: {os.getcwd()}")
-    
-    # Collect all .cpp source files under src/cpp (exclude build/)
-    cpp_files = []
-    for p in sorted(cpp_dir.rglob('*.cpp')):
-        rel = p.relative_to(cpp_dir)
-        if 'build' in rel.parts:
-            continue
-        cpp_files.append(str(rel))
 
-    if not cpp_files:
-        print("[ERROR] No .cpp files found to compile")
+    print(f"Project root: {project_root}")
+    print(f"C++ source dir: {cpp_dir}")
+    print(f"Build dir: {build_dir}")
+
+    # Clean and prepare build directory
+    if build_dir.exists():
+        print(f"\n[*] Cleaning build directory...")
+        import shutil
+        shutil.rmtree(build_dir)
+
+    build_dir.mkdir(parents=True, exist_ok=True)
+
+    # Determine CMake generator based on platform
+    generator = None
+    if platform.system() == "Windows":
+        generator = "Visual Studio 17 2022"
+    else:
+        generator = "Unix Makefiles"
+
+    # Configure with CMake
+    config_cmd = [
+        "cmake",
+        "-G", generator,
+        "-DCMAKE_BUILD_TYPE=Release",
+        str(cpp_dir)
+    ]
+
+    if not run_command(config_cmd, "Configuring with CMake"):
         sys.exit(1)
 
-    # Build command
-    build_cmd = [
-        "g++",
-        "-std=c++17",
-        "-I.",
-        "-pthread",
-        "-g",
-        "-o", "power_analyzer",
-    ] + cpp_files + ["-lgpiod"]
-    
-    # Build
-    if not run_command(build_cmd, "Building C++ project"):
+    # Build with CMake
+    build_cmd = ["cmake", "--build", str(build_dir), "--config", "Release"]
+    if not run_command(build_cmd, "Building with CMake"):
         sys.exit(1)
-    
-    # Run (pass 5 seconds runtime by default)
-    if not run_and_forward(["./power_analyzer", "0"], "Running power_analyzer"):
+
+    # Determine executable path
+    if platform.system() == "Windows":
+        exe_path = build_dir / "Release" / "power_analyzer.exe"
+    else:
+        exe_path = build_dir / "power_analyzer"
+
+    if not exe_path.exists():
+        print(f"[ERROR] Executable not found at {exe_path}")
         sys.exit(1)
-    
+
+    # Parse optional command-line arguments to pass to the program
+    program_args = sys.argv[1:] if len(sys.argv) > 1 else ["--run-seconds", "0"]
+    run_cmd = [str(exe_path)] + program_args
+
+    # Run the program
+    if not run_and_forward(run_cmd, "Running power_analyzer"):
+        sys.exit(1)
+
     print(f"\n{'='*60}")
     print("[✓] Success!")
     print(f"{'='*60}\n")
+
 
 if __name__ == "__main__":
     main()

@@ -39,18 +39,9 @@ private:
     IMeterDriver& driver_;
 
     /**
-     * @brief Range and finiteness validation for a raw measurement.
-     * @param raw  Raw snapshot from the driver.
+     * @brief Range and finiteness validation for a measurement.
+     * @param measurement  Snapshot from the driver.
      * @return true when every field is finite and within physical bounds.
      */
-    static bool validate(const RawMeasurement& raw);
-
-    /**
-     * @brief Copy a RawMeasurement into a MeterMeasurement and stamp the valid flag.
-     * @param raw    Source snapshot.
-     * @param valid  Result of validate(raw); written to @c MeterMeasurement::valid.
-     * @return The fully populated MeterMeasurement.
-     */
-    static MeterMeasurement toMeterMeasurement(const RawMeasurement& raw,
-                                               bool valid);
+    static bool validate(const MeterMeasurement& measurement);
 };

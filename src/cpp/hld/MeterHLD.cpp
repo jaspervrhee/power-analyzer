@@ -38,26 +38,24 @@ bool MeterHLD::isAvailable() const
     return driver_.isConnected();
 }
 
-// Reads a raw measurement, validates it and populates the outgoing measurement struct.
+// Reads a measurement, validates it and populates the outgoing measurement struct.
 bool MeterHLD::getMeasurement(MeterMeasurement &measurement)
 {
-    RawMeasurement raw{};
-    const bool readOk = driver_.readMeasurement(raw);
+    const bool readOk = driver_.readMeasurement(measurement);
 
     if (!readOk)
     {
-        measurement = toMeterMeasurement(raw, false);
+        measurement.valid = false;
         return false;
     }
 
-    const bool valid = validate(raw);
-    measurement = toMeterMeasurement(raw, valid);
-    return valid;
+    measurement.valid = validate(measurement);
+    return measurement.valid;
 }
 
 
 // Checks that every field is free of NaN/Inf and within physically plausible bounds.
-bool MeterHLD::validate(const RawMeasurement &r)
+bool MeterHLD::validate(const MeterMeasurement &r)
 {
     // Currents — non-negative, within rated range
     if (!isFiniteAndNonNegative(r.currentL1) || r.currentL1 > Limits::CURRENT_MAX_A)
@@ -108,37 +106,4 @@ bool MeterHLD::validate(const RawMeasurement &r)
         return false;
 
     return true;
-}
-
-// Copies all fields from a RawMeasurement into a MeterMeasurement and sets the valid flag.
-MeterMeasurement MeterHLD::toMeterMeasurement(const RawMeasurement &r, bool valid)
-{
-    MeterMeasurement m{};
-    m.valid = valid;
-    m.measuredAt = r.measuredAt;
-
-    m.currentL1 = r.currentL1;
-    m.currentL2 = r.currentL2;
-    m.currentL3 = r.currentL3;
-    m.currentAvg = r.currentAvg;
-
-    m.voltageL1L2 = r.voltageL1L2;
-    m.voltageL2L3 = r.voltageL2L3;
-    m.voltageL3L1 = r.voltageL3L1;
-    m.voltageLLAvg = r.voltageLLAvg;
-
-    m.voltageL1N = r.voltageL1N;
-    m.voltageL2N = r.voltageL2N;
-    m.voltageL3N = r.voltageL3N;
-    m.voltageLNAvg = r.voltageLNAvg;
-
-    m.activePowerL1 = r.activePowerL1;
-    m.activePowerL2 = r.activePowerL2;
-    m.activePowerL3 = r.activePowerL3;
-    m.totalActivePower = r.totalActivePower;
-
-    m.powerFactor = r.powerFactor;
-    m.frequency = r.frequency;
-
-    return m;
 }

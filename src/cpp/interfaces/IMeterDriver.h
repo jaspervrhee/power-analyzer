@@ -29,8 +29,8 @@ public:
     /**
      * Read a complete measurement snapshot from the meter.
      *
-     * @param measurement  Output: populated with raw values on success
+     * @param measurement  Output: populated with values on success; valid flag not set by driver
      * @return true when all register reads succeeded
      */
-    virtual bool readMeasurement(RawMeasurement& measurement) = 0;
+    virtual bool readMeasurement(MeterMeasurement& measurement) = 0;
 };

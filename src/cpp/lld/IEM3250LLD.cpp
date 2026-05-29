@@ -231,7 +231,7 @@ bool IEM3250LLD::isConnected() const
     return comm_.isConnected();
 }
 
-bool IEM3250LLD::readMeasurement(RawMeasurement &m)
+bool IEM3250LLD::readMeasurement(MeterMeasurement &m)
 {
     if (!isConnected())
     {

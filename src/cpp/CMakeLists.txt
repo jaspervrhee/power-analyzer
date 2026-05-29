@@ -20,3 +20,14 @@ target_link_libraries(power_analyzer_lib PRIVATE pthread gpiod)
 
 add_executable(power_analyzer main.cpp)
 target_link_libraries(power_analyzer PRIVATE power_analyzer_lib)
+
+# Testing
+enable_testing()
+find_package(GTest REQUIRED)
+
+add_executable(power_analyzer_tests
+    tests/ILogBackendTest.cpp
+)
+
+target_link_libraries(power_analyzer_tests PRIVATE power_analyzer_lib GTest::gtest GTest::gtest_main)
+add_test(NAME PowerAnalyzerTests COMMAND power_analyzer_tests)
