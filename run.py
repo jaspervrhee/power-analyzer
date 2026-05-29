@@ -97,7 +97,8 @@ def main():
         "cmake",
         "-G", generator,
         "-DCMAKE_BUILD_TYPE=Release",
-        str(cpp_dir)
+        "-B", str(build_dir),
+        "-S", str(cpp_dir)
     ]
 
     if not run_command(config_cmd, "Configuring with CMake"):
