@@ -26,8 +26,8 @@ struct Config {
     int         baudRate     = 38400;
     int         timeoutMs    = 30;
     std::string flogHost     = "134.188.254.132";
-    int         flogPort     = 17540;
-    int         bufferSize   = 100000;
+    uint16_t    flogPort     = 17540;
+    size_t      bufferSize   = 100000;
     int         pollInterval = 1;   // seconds
     int         runSeconds   = 3;   // 0 or negative = Ctrl-C mode
 };
