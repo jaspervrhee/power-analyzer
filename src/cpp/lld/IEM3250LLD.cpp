@@ -241,6 +241,16 @@ bool IEM3250LLD::readMeasurement(MeterMeasurement &m)
     // Stamp the measurement with the moment the cycle started
     m.measuredAt = std::chrono::system_clock::now();
 
+    // IEM3250 does not measure Q and S — zero them out
+    m.reactivePowerL1 = 0.0f;
+    m.reactivePowerL2 = 0.0f;
+    m.reactivePowerL3 = 0.0f;
+    m.totalReactivePower = 0.0f;
+    m.apparentPowerL1 = 0.0f;
+    m.apparentPowerL2 = 0.0f;
+    m.apparentPowerL3 = 0.0f;
+    m.totalApparentPower = 0.0f;
+
     // Map of register -> destination field for this cycle
     std::vector<SingleRead> reads = {
         {Reg::I1,        &m.currentL1},

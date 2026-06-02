@@ -46,7 +46,7 @@ void LogHLD::logMeasurement(const MeterMeasurement& measurement)
     LogEntry entry;
     entry.timestamp = std::chrono::system_clock::now();
     entry.level     = measurement.valid ? LogLevel::Info : LogLevel::Warning;
-    entry.tablePath = "functional/power";
+    entry.tablePath = "power";
     entry.tableName = "measurements";
     fillMeasurementRow(measurement, entry.columns, entry.values);
 
@@ -111,6 +111,8 @@ void LogHLD::fillMeasurementRow(const MeterMeasurement& m,
         "U1N", "U2N", "U3N", "ULNavg",
         "U12", "U23", "U31", "ULLavg",
         "P1", "P2", "P3", "Ptot",
+        "Q1", "Q2", "Q3", "Qtot",
+        "S1", "S2", "S3", "Stot",
         "PF", "f"
     };
     values = {
@@ -120,6 +122,8 @@ void LogHLD::fillMeasurementRow(const MeterMeasurement& m,
         f2s(m.voltageL1N),   f2s(m.voltageL2N),   f2s(m.voltageL3N),   f2s(m.voltageLNAvg),
         f2s(m.voltageL1L2),  f2s(m.voltageL2L3),  f2s(m.voltageL3L1),  f2s(m.voltageLLAvg),
         f2s(m.activePowerL1),f2s(m.activePowerL2),f2s(m.activePowerL3),f2s(m.totalActivePower),
+        f2s(m.reactivePowerL1),f2s(m.reactivePowerL2),f2s(m.reactivePowerL3),f2s(m.totalReactivePower),
+        f2s(m.apparentPowerL1),f2s(m.apparentPowerL2),f2s(m.apparentPowerL3),f2s(m.totalApparentPower),
         f2s(m.powerFactor),  f2s(m.frequency)
     };
 }

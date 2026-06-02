@@ -97,6 +97,26 @@ bool MeterHLD::validate(const MeterMeasurement &r)
     if (!std::isfinite(r.totalActivePower) || std::abs(r.totalActivePower) > Limits::POWER_MAX_KW)
         return false;
 
+    // Reactive power (can be negative)
+    if (!std::isfinite(r.reactivePowerL1) || std::abs(r.reactivePowerL1) > Limits::POWER_MAX_KW)
+        return false;
+    if (!std::isfinite(r.reactivePowerL2) || std::abs(r.reactivePowerL2) > Limits::POWER_MAX_KW)
+        return false;
+    if (!std::isfinite(r.reactivePowerL3) || std::abs(r.reactivePowerL3) > Limits::POWER_MAX_KW)
+        return false;
+    if (!std::isfinite(r.totalReactivePower) || std::abs(r.totalReactivePower) > Limits::POWER_MAX_KW)
+        return false;
+
+    // Apparent power (always non-negative)
+    if (!isFiniteAndNonNegative(r.apparentPowerL1) || r.apparentPowerL1 > Limits::POWER_MAX_KW)
+        return false;
+    if (!isFiniteAndNonNegative(r.apparentPowerL2) || r.apparentPowerL2 > Limits::POWER_MAX_KW)
+        return false;
+    if (!isFiniteAndNonNegative(r.apparentPowerL3) || r.apparentPowerL3 > Limits::POWER_MAX_KW)
+        return false;
+    if (!isFiniteAndNonNegative(r.totalApparentPower) || r.totalApparentPower > Limits::POWER_MAX_KW)
+        return false;
+
     // Power factor [-1, 1]
     if (!inRange(r.powerFactor, -Limits::PF_MAX, Limits::PF_MAX))
         return false;

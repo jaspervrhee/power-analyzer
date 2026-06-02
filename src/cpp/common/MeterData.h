@@ -33,6 +33,16 @@ struct MeterMeasurement {
     float activePowerL3;    ///< P3  [kW]
     float totalActivePower; ///< P   [kW]
 
+    float reactivePowerL1;  ///< Q1  [kVAR]
+    float reactivePowerL2;  ///< Q2  [kVAR]
+    float reactivePowerL3;  ///< Q3  [kVAR]
+    float totalReactivePower; ///< Q [kVAR]
+
+    float apparentPowerL1;  ///< S1  [kVA]
+    float apparentPowerL2;  ///< S2  [kVA]
+    float apparentPowerL3;  ///< S3  [kVA]
+    float totalApparentPower; ///< S [kVA]
+
     float powerFactor;      ///< PF  [-]
     float frequency;        ///< f   [Hz]
 

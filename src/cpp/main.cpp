@@ -221,8 +221,12 @@ static void printMeasurement(const MeterMeasurement &m)
     std::cout << "Current  L1/L2/L3:     " << m.currentL1 << " / " << m.currentL2 << " / " << m.currentL3 << " A\n";
     std::cout << "Voltage L1-N/L2-N/L3-N: " << m.voltageL1N << " / " << m.voltageL2N << " / " << m.voltageL3N << " V\n";
     std::cout << "Voltage L1-L2/L2-L3/L3-L1: " << m.voltageL1L2 << " / " << m.voltageL2L3 << " / " << m.voltageL3L1 << " V\n";
-    std::cout << "Power P1/P2/P3:        " << m.activePowerL1 << " / " << m.activePowerL2 << " / " << m.activePowerL3 << " kW\n";
-    std::cout << "Total power:           " << m.totalActivePower << " kW\n";
+    std::cout << "Active Power P1/P2/P3:        " << m.activePowerL1 << " / " << m.activePowerL2 << " / " << m.activePowerL3 << " kW\n";
+    std::cout << "Total active power:           " << m.totalActivePower << " kW\n";
+    std::cout << "Reactive Power Q1/Q2/Q3:     " << m.reactivePowerL1 << " / " << m.reactivePowerL2 << " / " << m.reactivePowerL3 << " kVAR\n";
+    std::cout << "Total reactive power:        " << m.totalReactivePower << " kVAR\n";
+    std::cout << "Apparent Power S1/S2/S3:     " << m.apparentPowerL1 << " / " << m.apparentPowerL2 << " / " << m.apparentPowerL3 << " kVA\n";
+    std::cout << "Total apparent power:        " << m.totalApparentPower << " kVA\n";
     std::cout << "Power factor:          " << m.powerFactor << "\n";
     std::cout << "Frequency:             " << m.frequency << " Hz\n";
 }
